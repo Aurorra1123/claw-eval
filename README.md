@@ -30,6 +30,11 @@ Browse the full leaderboard and individual task cases at **[claw-eval.github.io]
 * **Reproducibility:** We are committed to end-to-end reproducibility. Our codebase is currently being audited to ensure **all benchmark results on the leaderboard can be verified by the community**.
 * **Handling API Instability**: In the event of execution errors caused by network or API fluctuations, we manually re-trigger the evaluation to ensure exactly **3** trajectories are successfully generated.
 
+## Get Involved
+
+ClawEval has been publicly referenced or evaluated on by teams including [Meta (Muse Spark)](https://x.com/alexandr_wang/status/2045348588734066794?s=20), [KAT-Coder-V2](https://arxiv.org/abs/2603.27703), [Kimi](https://www.kimi.com/blog/kimi-k2-6), [Qwen](https://qwen.ai/blog?id=qwen3.6), [Tencent Hunyuan](https://github.com/Tencent-Hunyuan/Hy3-preview), [Xiaomi MiMo](https://mimo.xiaomi.com/mimo-v2-5-pro), and [Z.AI / GLM](https://docs.z.ai/guides/vlm/glm-5v-turbo#pure-text-coding-tasks). We are grateful to see ClawEval becoming a shared point of reference across the ecosystem.
+
+To run ClawEval, submit results, or join the leaderboard, contact: **bwye@stu.pku.edu.cn**, **lirang410@gmail.com**, **nlp.lilei@gmail.com**.
 
 ## 📢 Updates
 * **v1.1.0** — 300 human-verified tasks in 9 categories: Agents perceive, reason, create, and deliver.
