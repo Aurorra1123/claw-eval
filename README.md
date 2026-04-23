@@ -32,9 +32,9 @@ Browse the full leaderboard and individual task cases at **[claw-eval.github.io]
 
 ## Get Involved
 
-ClawEval has been publicly referenced or evaluated on by teams including [Meta (Muse Spark)](https://x.com/alexandr_wang/status/2045348588734066794?s=20), [KAT-Coder-V2](https://arxiv.org/abs/2603.27703), [Kimi](https://www.kimi.com/blog/kimi-k2-6), [Qwen](https://qwen.ai/blog?id=qwen3.6), [Tencent Hunyuan](https://github.com/Tencent-Hunyuan/Hy3-preview), [Xiaomi MiMo](https://mimo.xiaomi.com/mimo-v2-5-pro), and [Z.AI / GLM](https://docs.z.ai/guides/vlm/glm-5v-turbo#pure-text-coding-tasks). We are grateful to see ClawEval becoming a shared point of reference across the ecosystem.
+We sincerely thank the teams behind [Meta (Muse Spark)](https://x.com/alexandr_wang/status/2045348588734066794?s=20), [KAT-Coder-V2](https://arxiv.org/abs/2603.27703), [Kimi](https://www.kimi.com/blog/kimi-k2-6), [Qwen](https://qwen.ai/blog?id=qwen3.6), [Tencent Hunyuan](https://github.com/Tencent-Hunyuan/Hy3-preview), [Xiaomi MiMo](https://mimo.xiaomi.com/mimo-v2-5-pro), and [Z.AI / GLM](https://docs.z.ai/guides/vlm/glm-5v-turbo#pure-text-coding-tasks) for publicly referencing, evaluating on, and engaging with ClawEval. We are grateful for this recognition, and we hope ClawEval can help the community jointly build a more scientific foundation for evaluating the general agentic capabilities of foundation models.
 
-To run ClawEval, submit results, or join the leaderboard, contact: **bwye@stu.pku.edu.cn**, **lirang410@gmail.com**, **nlp.lilei@gmail.com**.
+To run ClawEval and submit results to join the leaderboard, contact: **bwye@stu.pku.edu.cn**, **lirang410@gmail.com**, **nlp.lilei@gmail.com**.
 
 ## 📢 Updates
 * **v1.1.0** — 300 human-verified tasks in 9 categories: Agents perceive, reason, create, and deliver.
