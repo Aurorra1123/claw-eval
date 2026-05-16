@@ -1,4 +1,4 @@
-"""T21en_scheduled_task_management grader — English variant."""
+"""T042_scheduled_task_managementen_scheduled_task_management grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 

@@ -252,6 +252,7 @@ class OpenAICompatProvider:
         self.client = OpenAI(
             api_key=resolved_key,
             base_url=base_url,
+            timeout=300.0,
         )
 
     def chat(
@@ -288,9 +289,9 @@ class OpenAICompatProvider:
         if tools:
             kwargs["tools"] = [_tool_spec_to_openai(t) for t in tools]
 
-        max_retries = 20
+        max_retries = 5
         last_exc: Exception | None = None
-        use_stream = False  # default
+        use_stream = True  # default
         for attempt in range(max_retries + 1):
             try:
                 if attempt <= 1 and not use_stream:
@@ -385,6 +386,11 @@ class OpenAICompatProvider:
                 continue
             has_any_choice = True
             delta = chunk.choices[0].delta
+            if delta is None:
+                # Some non-standard endpoints (e.g. MindGPT) omit the `delta`
+                # field on the terminal chunk that carries finish_reason/usage.
+                # Standard OpenAI-compatible servers always send `delta: {}`.
+                continue
 
             # reasoning_content (thinking models: DeepSeek-R1, QwQ, etc.)
             # OpenRouter returns "reasoning" instead of "reasoning_content"

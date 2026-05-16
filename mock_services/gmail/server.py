@@ -194,7 +194,7 @@ def get_audit() -> dict[str, Any]:
     """Return all API calls for grader inspection."""
     return {
         "calls": _audit_log,
-        "sent_messages": _sent_messages,
+        "sent": _sent_messages,
         "drafts": _drafts,
     }
 

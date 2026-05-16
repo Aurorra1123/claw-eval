@@ -1,4 +1,4 @@
-"""T03en_email_reply_draft grader — English variant."""
+"""T006_email_reply_draften_email_reply_draft grader — English variant."""
 
 from claw_eval.graders.base import load_peer_grader
 
