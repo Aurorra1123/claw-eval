@@ -9,3 +9,5 @@ class ScheduledTaskManagementGraderEN(_Base):
     """English variant — overrides language-specific class attributes only."""
 
     OPS_EMAIL = "ops@company.com"
+    REPORT_KEYWORDS = ["healthy", "normal", "failed", "disabled", "abnormal", "recommendation"]
+    STALE_KEYWORDS = ["temporary", "30 days", "30-day", "expired", "stale", "cleanup", "clean up", "evaluate for deletion"]

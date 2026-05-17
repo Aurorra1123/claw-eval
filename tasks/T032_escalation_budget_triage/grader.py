@@ -8,6 +8,16 @@ _Base = load_peer_grader("T031zh_escalation_budget_triage")
 class EscalationBudgetTriageGraderEN(_Base):
     """English variant — overrides language-specific class attributes and rubrics."""
 
+    # Email formatting labels (English)
+    _SENT_LABEL = "Sent"
+    _DRAFT_LABEL = "Draft"
+    _SENT_HEADER = "Sent Emails"
+    _DRAFT_HEADER = "Draft Emails"
+    _NO_EMAILS_FMT = "No {label} emails."
+    _EMAIL_TO_LABEL = "To"
+    _EMAIL_SUBJECT_LABEL = "Subject"
+    _EMAIL_BODY_LABEL = "Body"
+
     # ------------------------------------------------------------------
     # Customer markers for email content matching (English)
     # ------------------------------------------------------------------

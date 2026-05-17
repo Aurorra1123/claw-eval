@@ -8,6 +8,8 @@ _Base = load_peer_grader("T005zh_email_reply_draft")
 class EmailReplyDraftGraderEN(_Base):
     """English variant — overrides language-specific class attributes and rubrics."""
 
+    BOSS_FALLBACK_KEYWORDS = ["竞品", "分析报告", "competitor", "analysis report", "competitive"]
+
     # ------------------------------------------------------------------ #
     # LLM Judge rubrics (English)
     # ------------------------------------------------------------------ #
