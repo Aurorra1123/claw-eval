@@ -1,0 +1,19 @@
+// ClawEval bridge plugin entry — generated from task.yaml.
+//
+// The tools-array placeholder is replaced at generate time with the compiled
+// tool list (see harnesses/_openclaw_bridge/generator.py). Everything else in
+// this file is verbatim across all generated plugins so OpenClaw plugin-sdk
+// upgrades surface as a single template change.
+
+import { Type } from "typebox";
+import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
+import { recordCall } from "./recorder.js";
+
+export default defineToolPlugin({
+  id: "{{PLUGIN_ID}}",
+  name: "ClawEval Bridge",
+  description: "{{PLUGIN_DESCRIPTION}}",
+  tools: (tool) => [
+{{TOOLS_BLOCK}}
+  ],
+});

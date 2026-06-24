@@ -21,7 +21,8 @@ tasks/*/fixtures/*.webm
 
 logs/
 
-docs/
+# Phase 3 scratch (probe artifacts, npm caches, openclaw home dirs) — not for version control
+scratch/
 
 # Configs (contain API keys and internal endpoints)
 configs/

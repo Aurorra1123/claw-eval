@@ -38,6 +38,10 @@ class TraceStart(BaseModel):
     task_id: str
     model: str
     persona: str = "default"
+    # Harness that produced this trace. Default keeps old traces backward-compatible:
+    # pre-Phase-3 traces have no ``harness`` field, and pydantic ``model_validate``
+    # falls back to "claweval" when reading them — which is exactly what they came from.
+    harness: str = "claweval"
     timestamp: str = Field(default_factory=_now)
 
 

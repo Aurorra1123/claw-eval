@@ -129,6 +129,41 @@ def _make_user_agent(cfg, task):
     )
 
 
+def _cfg_with_model_overrides(
+    cfg,
+    *,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+):
+    """Return a copy of ``cfg`` with CLI model/api_key/base_url overrides applied.
+
+    The harness layer is given a single ``cfg`` — we baked the overrides into a
+    cloned cfg so harnesses don't need to know about argparse. None values fall
+    back to the existing cfg.model fields (no overwrite with None).
+    """
+    overrides: dict = {}
+    if model is not None:
+        overrides["model_id"] = model
+    if api_key is not None:
+        overrides["api_key"] = api_key
+    if base_url is not None:
+        overrides["base_url"] = base_url
+    if not overrides:
+        return cfg
+    new_model = cfg.model.model_copy(update=overrides)
+    return cfg.model_copy(update={"model": new_model})
+
+
+def _run_harness_preflight(harness, task) -> None:
+    """Run harness.preflight; print errors to stderr and exit on failure."""
+    errs = harness.preflight(task)
+    for err in errs:
+        print(f"[preflight] {err}", file=sys.stderr)
+    if errs:
+        raise SystemExit(1)
+
+
 def _collect_env_snapshot(sandbox_url: str, task) -> dict:
     """Collect environment data from the container after the agent loop finishes.
 
@@ -321,17 +356,18 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     from .config import load_config
     from .graders.registry import get_grader
+    from .harnesses import get_harness
     from .models.scoring import compute_pass_at_k, compute_pass_hat_k, compute_task_score, is_pass
     from .models.task import TaskDefinition
-    from .runner.loop import run_task
-    from .runner.providers.openai_compat import OpenAICompatProvider
     from .trace.reader import load_trace
 
     cfg = load_config(args.config)
+    harness = get_harness(args.harness)
 
     task_yaml = _resolve_task_yaml(args.task)
     task = TaskDefinition.from_yaml(task_yaml)
     tasks_dir = _resolve_tasks_dir(task_yaml)
+    _run_harness_preflight(harness, task)
 
     port_offset = getattr(args, "port_offset", 0) or 0
     if port_offset:
@@ -342,23 +378,44 @@ def cmd_run(args: argparse.Namespace) -> None:
     base_trace_dir = args.trace_dir or cfg.defaults.trace_dir
     trace_dir = _make_trace_dir(base_trace_dir, model_id)
 
+    # Bake CLI model/api_key/base_url overrides into cfg so the harness sees one
+    # source of truth.
+    cfg = _cfg_with_model_overrides(
+        cfg, model=args.model, api_key=args.api_key, base_url=args.base_url,
+    )
+
     # ---- Sandbox mode: container-based evaluation ----
     # Agent loop stays on host; container runs only the sandbox HTTP server.
+    # When ``--harness openclaw`` is used, the container *also* runs the
+    # OpenClaw subprocess (Wave 3-E §3.7).
     sandbox_mode = getattr(args, "sandbox", False) or cfg.sandbox.enabled
+
+    # Phase 3 Wave 3-E §7: OpenClaw must NOT run in host mode for production
+    # evaluation. ``--harness openclaw`` without ``--sandbox`` is refused
+    # unless the user opts into host smoke explicitly via the escape hatch
+    # env var (used by ``tests/test_openclaw_e2e.py``).
+    if args.harness == "openclaw" and not sandbox_mode:
+        if os.environ.get("CLAWEVAL_ALLOW_OPENCLAW_HOST_SMOKE") != "1":
+            print(
+                "ERROR: --harness openclaw requires --sandbox for production.\n"
+                "OpenClaw on host can read tasks/<id>/grader.py (no isolation,\n"
+                "design doc §3.7 / §7). To run the legacy Wave 3-D host smoke\n"
+                "test, set CLAWEVAL_ALLOW_OPENCLAW_HOST_SMOKE=1 (not for\n"
+                "production evaluation).",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
     if sandbox_mode:
         from .runner.sandbox_runner import SandboxRunner
         from .runner.services import ServiceManager
 
         sandbox_image = getattr(args, "sandbox_image", None) or cfg.sandbox.image
+        # OpenClaw harness defaults to its own image (OpenClaw CLI + sandbox
+        # server). The user can still override via --sandbox-image.
+        if args.harness == "openclaw" and getattr(args, "sandbox_image", None) is None:
+            sandbox_image = "claw-eval-agent-openclaw:latest"
         runner = SandboxRunner(cfg.sandbox, image=sandbox_image)
-        provider = OpenAICompatProvider(
-            model_id=model_id,
-            api_key=args.api_key or cfg.model.api_key,
-            base_url=args.base_url or cfg.model.base_url,
-            extra_body=cfg.model.extra_body,
-            temperature=cfg.model.temperature,
-            reasoning_effort=cfg.model.reasoning_effort,
-        )
         judge = _make_judge(cfg, args)
         trials = args.trials or 1
         trial_scores: list[float] = []
@@ -372,29 +429,55 @@ def cmd_run(args: argparse.Namespace) -> None:
                     svc.reset_all()
 
                 run_id = f"{task.task_id}-trial{i}"
-                handle = runner.start_container(run_id=run_id)
+                # OpenClaw container needs host networking (so OpenClaw inside
+                # can reach host mock services + so host can probe the
+                # in-container sandbox server through localhost) plus a volume
+                # mount of the per-task case_dir at the same path on both
+                # sides. The bridge plugin writes its traffic log there;
+                # OpenClaw state dir lives there; everything materialised on
+                # host is readable inside the container.
+                start_kwargs: dict = {"run_id": run_id}
+                case_dir_mount: Path | None = None
+                if args.harness == "openclaw":
+                    case_dir_mount = (
+                        Path(trace_dir) / f"{task.task_id}_{run_id}_raw"
+                    )
+                    case_dir_mount.mkdir(parents=True, exist_ok=True)
+                    start_kwargs["network_mode"] = "host"
+                    start_kwargs["volumes"] = {str(case_dir_mount): str(case_dir_mount)}
+                    bridge_log_in_container = case_dir_mount / "raw" / "bridge_traffic.jsonl"
+                    start_kwargs["extra_env"] = {
+                        "CLAWEVAL_BRIDGE_LOG": str(bridge_log_in_container),
+                    }
+                handle = runner.start_container(**start_kwargs)
                 try:
                     n_injected = runner.inject_files(handle, task, task_dir=str(task_yaml.parent))
                     expected_files = len(task.sandbox_files) if task.sandbox_files else len(getattr(task.environment, "fixtures", []))
                     if expected_files and n_injected < expected_files:
                         print(f"[WARNING] inject_files: only {n_injected}/{expected_files} files injected")
-                    trace_path = run_task(
-                        task, provider,
+                    result = harness.run(
+                        task,
                         trace_dir=trace_dir,
-                        sandbox_tools=True,
-                        sandbox_url=handle.sandbox_url,
-                        prompt_cfg=cfg.prompt,
-                        model_cfg=cfg.model,
-                        media_cfg=cfg.media,
+                        run_id=run_id,
+                        cfg=cfg,
+                        sandbox_handle=handle,
                         user_agent=_make_user_agent(cfg, task),
+                        services_ctx=svc,
+                        sandbox_tools=True,
                     )
+                    trace_path = result.trace_path
                     # Inject grader-only files (e.g. verify scripts with answers)
                     # AFTER the agent loop so the agent cannot read them.
                     n_grader = runner.inject_grader_files(handle, task, task_dir=str(task_yaml.parent))
                     if task.sandbox_grader_files and n_grader < len(task.sandbox_grader_files):
                         print(f"[WARNING] inject_grader_files: only {n_grader}/{len(task.sandbox_grader_files)} files injected")
-                    # Collect env snapshot before destroying container
-                    env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
+                    # Collect env snapshot before destroying container.
+                    # ClawEvalHarness intentionally leaves env_snapshot=None so
+                    # this collection can run AFTER inject_grader_files; other
+                    # harnesses that populate result.env_snapshot win that race.
+                    env_snapshot = result.env_snapshot
+                    if env_snapshot is None:
+                        env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
                     _save_env_snapshot(env_snapshot, trace_path, task.task_id)
                 finally:
                     runner.stop_container(handle)
@@ -476,15 +559,6 @@ def cmd_run(args: argparse.Namespace) -> None:
         return
 
     # ---- Normal (local) mode ----
-    provider = OpenAICompatProvider(
-        model_id=model_id,
-        api_key=args.api_key or cfg.model.api_key,
-        base_url=args.base_url or cfg.model.base_url,
-        extra_body=cfg.model.extra_body,
-        temperature=cfg.model.temperature,
-        reasoning_effort=cfg.model.reasoning_effort,
-    )
-
     judge = _make_judge(cfg, args)
     sandbox_tools = getattr(args, "sandbox_tools", False)
 
@@ -503,22 +577,26 @@ def cmd_run(args: argparse.Namespace) -> None:
             if i > 0:
                 svc.reset_all()
 
-            trace_path = run_task(
-                task, provider,
+            run_id = f"{task.task_id}-trial{i}"
+            result = harness.run(
+                task,
                 trace_dir=trace_dir,
-                sandbox_tools=sandbox_tools,
-                prompt_cfg=cfg.prompt,
-                model_cfg=cfg.model,
-                media_cfg=cfg.media,
+                run_id=run_id,
+                cfg=cfg,
+                sandbox_handle=None,
                 user_agent=_make_user_agent(cfg, task),
+                services_ctx=svc,
+                sandbox_tools=sandbox_tools,
             )
+            trace_path = result.trace_path
             trace_paths_local.append(trace_path)
             print(f"Trace: {trace_path}")
 
             # Read local grader files from host (GT files, never touched by agent)
-            env_snapshot: dict | None = None
+            env_snapshot: dict | None = result.env_snapshot
             if task.local_grader_files:
-                env_snapshot = {}
+                if env_snapshot is None:
+                    env_snapshot = {}
                 import base64 as _b64
                 task_root = Path(str(task_yaml.parent))
                 for rel_path in task.local_grader_files:
@@ -579,27 +657,26 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
 
     from .config import load_config
     from .graders.registry import get_grader
+    from .harnesses import get_harness
     from .models.scoring import compute_task_score, is_pass
     from .models.task import TaskDefinition
-    from .runner.loop import run_task
-    from .runner.providers.openai_compat import OpenAICompatProvider
     from .runner.services import ServiceManager
     from .trace.reader import load_trace
 
     cfg = load_config(args.config)
+    harness = get_harness(args.harness)
 
     task_yaml = _resolve_task_yaml(args.task)
     task = TaskDefinition.from_yaml(task_yaml)
     tasks_dir = _resolve_tasks_dir(task_yaml)
+    _run_harness_preflight(harness, task)
 
     model_id = args.model or cfg.model.model_id
-    provider = OpenAICompatProvider(
-        model_id=model_id,
-        api_key=args.api_key or cfg.model.api_key or os.environ.get("OPENAI_API_KEY"),
-        base_url=args.base_url or cfg.model.base_url,
-        extra_body=cfg.model.extra_body,
-        temperature=cfg.model.temperature,
-        reasoning_effort=cfg.model.reasoning_effort,
+    # _run-inner has an extra fallback to $OPENAI_API_KEY that the other paths
+    # don't — preserved here by resolving the effective key before baking into cfg.
+    effective_api_key = args.api_key or cfg.model.api_key or os.environ.get("OPENAI_API_KEY")
+    cfg = _cfg_with_model_overrides(
+        cfg, model=args.model, api_key=effective_api_key, base_url=args.base_url,
     )
 
     sandbox_tools = getattr(args, "sandbox_tools", False)
@@ -611,16 +688,19 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
     else:
         trace_dir = _make_trace_dir(cfg.defaults.trace_dir, model_id)
 
-    with ServiceManager(task.services, mock_today=task.environment.mock_today):
-        trace_path = run_task(
-            task, provider,
+    run_id = f"{task.task_id}-inner"
+    with ServiceManager(task.services, mock_today=task.environment.mock_today) as svc:
+        result = harness.run(
+            task,
             trace_dir=trace_dir,
-            sandbox_tools=sandbox_tools,
-            prompt_cfg=cfg.prompt,
-            model_cfg=cfg.model,
-            media_cfg=cfg.media,
+            run_id=run_id,
+            cfg=cfg,
+            sandbox_handle=None,
             user_agent=_make_user_agent(cfg, task),
+            services_ctx=svc,
+            sandbox_tools=sandbox_tools,
         )
+    trace_path = result.trace_path
 
     print(f"Trace: {trace_path}")
 
@@ -639,7 +719,7 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
     result = {
         "task_id": task.task_id,
         "task_name": task.task_name,
-        "model": provider.model_id,
+        "model": model_id,
         "trace": trace_path.name,
         "turns": end.total_turns if end else 0,
         "model_input_tokens": totals["model_input_tokens"],
@@ -781,6 +861,7 @@ def _run_single_task(
     sandbox: bool = False,
     sandbox_image: str | None = None,
     sandbox_tools: bool = False,
+    harness_name: str = "claweval",
 ) -> dict:
     """Run a single task in a worker process. Returns a result dict."""
     # Ensure localhost bypasses proxy in worker processes.
@@ -792,29 +873,35 @@ def _run_single_task(
 
     from .config import load_config
     from .graders.registry import get_grader
+    from .harnesses import get_harness
     from .models.scoring import compute_pass_at_k, compute_pass_hat_k, compute_task_score, is_pass
     from .models.task import TaskDefinition
-    from .runner.loop import run_task
-    from .runner.providers.openai_compat import OpenAICompatProvider
     from .runner.services import ServiceManager
     from .trace.reader import load_trace
+
+    harness = get_harness(harness_name)
 
     task_yaml = _resolve_task_yaml(task_dir)
     task = TaskDefinition.from_yaml(task_yaml)
     tasks_dir = _resolve_tasks_dir(task_yaml)
 
+    # Preflight: if blocked, surface as a task-level error (worker can't raise
+    # SystemExit cleanly inside ProcessPoolExecutor).
+    preflight_errs = harness.preflight(task)
+    if preflight_errs:
+        return {
+            "task_id": task.task_id,
+            "task_name": task.task_name,
+            "difficulty": task.difficulty,
+            "trials": [],
+            "error": "preflight: " + "; ".join(preflight_errs),
+        }
+
     if port_offset:
         task.apply_port_offset(port_offset)
 
     cfg = load_config(config_path)
-    provider = OpenAICompatProvider(
-        model_id=model or cfg.model.model_id,
-        api_key=api_key or cfg.model.api_key,
-        base_url=base_url or cfg.model.base_url,
-        extra_body=cfg.model.extra_body,
-        temperature=cfg.model.temperature,
-        reasoning_effort=cfg.model.reasoning_effort,
-    )
+    cfg = _cfg_with_model_overrides(cfg, model=model, api_key=api_key, base_url=base_url)
 
     # Build judge if needed
     judge = None
@@ -864,33 +951,43 @@ def _run_single_task(
                                 expected_files = len(task.sandbox_files) if task.sandbox_files else len(getattr(task.environment, "fixtures", []))
                                 if expected_files and n_injected < expected_files:
                                     print(f"[WARNING] inject_files: only {n_injected}/{expected_files} files injected")
-                                trace_path = run_task(
-                                    task, provider,
+                                result_h = harness.run(
+                                    task,
                                     trace_dir=trace_dir or cfg.defaults.trace_dir,
-                                    sandbox_tools=True,
-                                    sandbox_url=handle.sandbox_url,
-                                    prompt_cfg=cfg.prompt,
-                                    model_cfg=cfg.model,
-                                    media_cfg=cfg.media,
+                                    run_id=run_id,
+                                    cfg=cfg,
+                                    sandbox_handle=handle,
                                     user_agent=_make_user_agent(cfg, task),
+                                    services_ctx=svc,
+                                    sandbox_tools=True,
                                 )
+                                trace_path = result_h.trace_path
                                 n_grader = sandbox_runner.inject_grader_files(handle, task, task_dir=task_dir)
                                 if task.sandbox_grader_files and n_grader < len(task.sandbox_grader_files):
                                     print(f"[WARNING] inject_grader_files: only {n_grader}/{len(task.sandbox_grader_files)} files injected")
-                                env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
+                                # ClawEvalHarness leaves env_snapshot=None so
+                                # the collection can run AFTER inject_grader_files;
+                                # other harnesses that populate it win that race.
+                                env_snapshot = result_h.env_snapshot
+                                if env_snapshot is None:
+                                    env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
                                 _save_env_snapshot(env_snapshot, trace_path, task.task_id)
                             finally:
                                 sandbox_runner.stop_container(handle)
                         else:
-                            trace_path = run_task(
-                                task, provider,
+                            run_id = f"{task.task_id}-t{i}-p{port_offset}"
+                            result_h = harness.run(
+                                task,
                                 trace_dir=trace_dir or cfg.defaults.trace_dir,
-                                sandbox_tools=sandbox_tools,
-                                prompt_cfg=cfg.prompt,
-                                model_cfg=cfg.model,
-                                media_cfg=cfg.media,
+                                run_id=run_id,
+                                cfg=cfg,
+                                sandbox_handle=None,
                                 user_agent=_make_user_agent(cfg, task),
+                                services_ctx=svc,
+                                sandbox_tools=sandbox_tools,
                             )
+                            trace_path = result_h.trace_path
+                            env_snapshot = result_h.env_snapshot
 
                         # Read local grader files from host (GT files, never touched by agent)
                         if task.local_grader_files:
@@ -1304,6 +1401,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
                 sandbox=getattr(args, "sandbox", False),
                 sandbox_image=getattr(args, "sandbox_image", None),
                 sandbox_tools=getattr(args, "sandbox_tools", False),
+                harness_name=getattr(args, "harness", "claweval"),
             )
             pending[fut] = (td, slot)
 
@@ -1593,6 +1691,10 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--sandbox-image", default=None, help="Override sandbox Docker image name")
     p_run.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
     p_run.add_argument("--proxy", default=None, help="HTTP proxy URL for model/judge API traffic (e.g. http://proxy:port)")
+    p_run.add_argument(
+        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        help="Agent harness driving the rollout (default: claweval)",
+    )
 
     # _run-inner (hidden — used inside sandbox containers)
     p_inner = sub.add_parser("_run-inner", help=argparse.SUPPRESS)
@@ -1606,6 +1708,10 @@ def main(argv: list[str] | None = None) -> None:
     p_inner.add_argument("--judge-model", default=None)
     p_inner.add_argument("--no-judge", action="store_true")
     p_inner.add_argument("--proxy", default=None)
+    p_inner.add_argument(
+        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        help="Agent harness driving the rollout (default: claweval)",
+    )
 
     # build-image
     p_build = sub.add_parser("build-image", help="Build the sandbox Docker image")
@@ -1643,6 +1749,10 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--sandbox", action="store_true", help="Run sandbox tools inside Docker containers")
     p_batch.add_argument("--sandbox-image", default=None, help="Override sandbox Docker image name")
     p_batch.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
+    p_batch.add_argument(
+        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        help="Agent harness driving the rollout (default: claweval)",
+    )
     p_batch.add_argument("--rerun-errors", default=None, metavar="TRACE_DIR",
                          help="Re-run only errored tasks from a previous batch run. "
                               "Reads batch_results.json from TRACE_DIR, re-runs errored tasks, "

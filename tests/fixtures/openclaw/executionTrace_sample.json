@@ -1,0 +1,115 @@
+[
+  {
+    "type": "text",
+    "role": "user",
+    "content": "请查询销售部门最近一个月的总支出。",
+    "timestamp": "2026-06-20T10:00:00.000Z"
+  },
+  {
+    "type": "text",
+    "role": "assistant",
+    "content": "好的,我先查询销售部门的支出数据。",
+    "timestamp": "2026-06-20T10:00:01.000Z",
+    "turn": 1,
+    "llm": {
+      "provider": "openai",
+      "baseUrl": "http://localhost:8100/v1",
+      "model": "qwen3-32b",
+      "usage": {
+        "prompt_tokens": 320,
+        "completion_tokens": 22,
+        "total_tokens": 342,
+        "cache_read": 0,
+        "cache_write": 0
+      },
+      "stopReason": "tool_use",
+      "errorMessage": null
+    }
+  },
+  {
+    "type": "tool",
+    "role": "tool",
+    "tool": "officeqa_query_spending",
+    "callID": "call_sales_001",
+    "timestamp": "2026-06-20T10:00:02.000Z",
+    "startedAt": "2026-06-20T10:00:02.000Z",
+    "finishedAt": "2026-06-20T10:00:02.150Z",
+    "durationMs": 150,
+    "input": {
+      "department": "sales",
+      "period": "last_month"
+    },
+    "output": {
+      "text": "{\"department\": \"sales\", \"total\": 128500.50, \"currency\": \"CNY\"}"
+    },
+    "exitCode": 0,
+    "status": "ok"
+  },
+  {
+    "type": "text",
+    "role": "user",
+    "content": "现在请查询采购部门的同期支出。",
+    "timestamp": "2026-06-20T10:00:03.000Z"
+  },
+  {
+    "type": "text",
+    "role": "assistant",
+    "content": "好,正在查询。",
+    "timestamp": "2026-06-20T10:00:04.000Z",
+    "turn": 2,
+    "llm": {
+      "provider": "openai",
+      "baseUrl": "http://localhost:8100/v1",
+      "model": "qwen3-32b",
+      "usage": {
+        "prompt_tokens": 410,
+        "completion_tokens": 8,
+        "total_tokens": 418,
+        "cache_read": 0,
+        "cache_write": 0
+      },
+      "stopReason": "tool_use",
+      "errorMessage": null
+    }
+  },
+  {
+    "type": "tool",
+    "role": "tool",
+    "tool": "officeqa_query_spending",
+    "callID": "call_purch_002",
+    "timestamp": "2026-06-20T10:00:05.000Z",
+    "startedAt": "2026-06-20T10:00:05.000Z",
+    "finishedAt": "2026-06-20T10:00:05.080Z",
+    "durationMs": 80,
+    "input": {
+      "department": "purchasing",
+      "period": "last_month"
+    },
+    "output": {
+      "text": "{\"error\": \"internal_server_error\", \"message\": \"DB connection lost\"}"
+    },
+    "exitCode": 1,
+    "status": "error"
+  },
+  {
+    "type": "text",
+    "role": "assistant",
+    "content": "销售部门最近一个月总支出为 128500.50 元。采购部门数据查询失败,稍后请重试。",
+    "timestamp": "2026-06-20T10:00:06.000Z",
+    "turn": 3,
+    "llm": {
+      "provider": "openai",
+      "baseUrl": "http://localhost:8100/v1",
+      "model": "qwen3-32b",
+      "usage": {
+        "prompt_tokens": 480,
+        "completion_tokens": 36,
+        "total_tokens": 516,
+        "cache_read": 0,
+        "cache_write": 0
+      },
+      "stopReason": "stop",
+      "errorMessage": null
+    }
+  }
+]

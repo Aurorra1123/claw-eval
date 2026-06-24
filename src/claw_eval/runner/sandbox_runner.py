@@ -73,24 +73,74 @@ class SandboxRunner:
                 env[key] = val
         return env
 
-    def start_container(self, *, run_id: str) -> ContainerHandle:
+    def start_container(
+        self,
+        *,
+        run_id: str,
+        network_mode: str | None = None,
+        volumes: dict[str, str] | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> ContainerHandle:
         """Launch an agent container and wait for the sandbox service.
 
         Returns a *ContainerHandle* with the sandbox HTTP URL that the
         host-side dispatcher should send ``sandbox_*`` tool calls to.
+
+        Parameters
+        ----------
+        run_id:
+            Per-run identifier baked into the container name + labels.
+        network_mode:
+            ``"host"`` puts the container on the host's network namespace
+            (Wave 3-E §3.7 — needed so the OpenClaw subprocess inside the
+            container can reach mock services that bind to host localhost,
+            and so the host can probe the sandbox server through localhost).
+            When set, the ``ports`` mapping is dropped (host networking
+            ignores it) and the sandbox URL is built from
+            ``sandbox_config.sandbox_port`` directly.
+        volumes:
+            Optional ``{host_path: container_path}`` bind mounts. Wave 3-E
+            mounts ``case_dir`` at the same absolute path on both sides so
+            plugin / state-dir / log files materialised on the host are
+            visible inside the container without path translation.
+        extra_env:
+            Additional env vars to expose to the container process. Merged
+            with the proxy vars (proxy wins on collision because it's
+            applied second to match historical behaviour).
         """
-        container = self._docker.containers.run(
+        env: dict[str, str] = {}
+        if extra_env:
+            env.update(extra_env)
+        env.update(self._proxy_env())
+
+        run_kwargs: dict[str, Any] = dict(
             image=self._image,
             detach=True,
             name=f"claw-agent-{run_id}",
             mem_limit=self._config.memory_limit,
             nano_cpus=int(self._config.cpu_limit * 1e9),
-            ports={f"{self._config.sandbox_port}/tcp": None},  # random host port
             labels={"app": "claw-eval", "role": "agent", "run_id": run_id},
-            environment=self._proxy_env(),
+            environment=env,
         )
+        if volumes:
+            run_kwargs["volumes"] = {
+                host_path: {"bind": container_path, "mode": "rw"}
+                for host_path, container_path in volumes.items()
+            }
 
-        host_port = self._get_mapped_port(container)
+        if network_mode == "host":
+            # In host network mode docker ignores port publishing; the
+            # sandbox server listens directly on the host's port.
+            run_kwargs["network_mode"] = "host"
+        else:
+            run_kwargs["ports"] = {f"{self._config.sandbox_port}/tcp": None}
+
+        container = self._docker.containers.run(**run_kwargs)
+
+        if network_mode == "host":
+            host_port = int(self._config.sandbox_port)
+        else:
+            host_port = self._get_mapped_port(container)
         sandbox_url = f"http://localhost:{host_port}"
         self._wait_healthy(f"{sandbox_url}/health")
 
