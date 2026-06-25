@@ -51,6 +51,10 @@ class TraceMessage(BaseModel):
     message: Message
     usage: TokenUsage = Field(default_factory=TokenUsage)
     timestamp: str = Field(default_factory=_now)
+    # AOrchestra (Phase 4) labels each trace event with its agent role.
+    # "agent" is the harness-agnostic default — keeps Wave 1-3 traces
+    # deserializing byte-identically.
+    agent_role: Literal["main", "sub", "agent"] = "agent"
 
 
 class ToolDispatch(BaseModel):
@@ -64,6 +68,8 @@ class ToolDispatch(BaseModel):
     response_body: Any = None
     latency_ms: float = 0.0
     timestamp: str = Field(default_factory=_now)
+    # AOrchestra (Phase 4) labels each dispatch with the calling agent role.
+    agent_role: Literal["main", "sub", "agent"] = "agent"
 
 
 class AuditSnapshot(BaseModel):
