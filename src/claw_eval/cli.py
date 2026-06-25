@@ -406,6 +406,27 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
             raise SystemExit(2)
 
+    # Phase 4 Wave 4-D §4.2: AOrchestra is asymmetric vs OpenClaw — it's OK
+    # in host mode UNLESS the task declares SANDBOX_TOOL_NAMES. AOrchestra is
+    # a Python in-process library; host mode is safe when the agent doesn't
+    # ask for Bash/Read/Write/... tools that would otherwise need a sandbox
+    # server. Refuse the SANDBOX-tools-without-sandbox combo loudly here so
+    # the harness's preflight error has a clearer call site.
+    if args.harness == "aorchestra":
+        from .runner.sandbox_tools import SANDBOX_TOOL_NAMES as _SBX
+
+        task_needs_sandbox = any(t.name in _SBX for t in task.tools)
+        if task_needs_sandbox and not sandbox_mode:
+            sbx_names = [t.name for t in task.tools if t.name in _SBX]
+            print(
+                "ERROR: --harness aorchestra requires --sandbox when the task\n"
+                f"declares sandbox tools {sbx_names}. AOrchestra runs as a Python\n"
+                "library on host; sandbox tools need the in-container sandbox\n"
+                "server (design doc §4.2).",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
     if sandbox_mode:
         from .runner.sandbox_runner import SandboxRunner
         from .runner.services import ServiceManager
@@ -919,6 +940,24 @@ def _run_single_task(
     if sandbox_mode:
         from .runner.sandbox_runner import SandboxRunner
         sandbox_runner = SandboxRunner(cfg.sandbox, image=sandbox_image or cfg.sandbox.image)
+
+    # Phase 4 Wave 4-D §4.2 — same asymmetric AOrchestra gate as cmd_run.
+    if harness_name == "aorchestra":
+        from .runner.sandbox_tools import SANDBOX_TOOL_NAMES as _SBX
+
+        task_needs_sandbox = any(t.name in _SBX for t in task.tools)
+        if task_needs_sandbox and not sandbox_mode:
+            sbx_names = [t.name for t in task.tools if t.name in _SBX]
+            return {
+                "task_id": task.task_id,
+                "task_name": task.task_name,
+                "difficulty": task.difficulty,
+                "trials": [],
+                "error": (
+                    f"--harness aorchestra requires --sandbox when task declares "
+                    f"sandbox tools {sbx_names} (design doc §4.2)"
+                ),
+            }
 
     result = {
         "task_id": task.task_id,
@@ -1692,7 +1731,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
     p_run.add_argument("--proxy", default=None, help="HTTP proxy URL for model/judge API traffic (e.g. http://proxy:port)")
     p_run.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
 
@@ -1709,7 +1748,7 @@ def main(argv: list[str] | None = None) -> None:
     p_inner.add_argument("--no-judge", action="store_true")
     p_inner.add_argument("--proxy", default=None)
     p_inner.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
 
@@ -1750,7 +1789,7 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--sandbox-image", default=None, help="Override sandbox Docker image name")
     p_batch.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
     p_batch.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
     p_batch.add_argument("--rerun-errors", default=None, metavar="TRACE_DIR",

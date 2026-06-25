@@ -4,10 +4,11 @@ Phase 3 §3.1 / §3.2 — see docs/harness_design.md.
 
 Currently registered:
 
-* ``claweval``  — reference implementation (Wave 1)
-* ``openclaw``  — OpenClaw CLI agent (Wave 3-D host smoke + Wave 3-E container)
-* ``codex``     — placeholder, raises NotImplementedError (Wave 3-F / §6.8)
-* ``claudecode``— placeholder, raises NotImplementedError (Wave 3-F / §6.8)
+* ``claweval``   — reference implementation (Wave 1)
+* ``openclaw``   — OpenClaw CLI agent (Wave 3-D host smoke + Wave 3-E container)
+* ``aorchestra`` — AOrchestra MainAgent + SubAgent (Phase 4 Wave 4-D host smoke)
+* ``codex``      — placeholder, raises NotImplementedError (Wave 3-F / §6.8)
+* ``claudecode`` — placeholder, raises NotImplementedError (Wave 3-F / §6.8)
 
 Codex and Claude Code occupy registry slots so the CLI's ``--harness``
 choices accept them as valid names — running a task through either of them
@@ -16,6 +17,7 @@ fails loudly at ``preflight`` / ``run``, not silently with a bogus trace.
 
 from __future__ import annotations
 
+from .aorchestra import AOrchestraHarness
 from .base import Harness, HarnessFeature, HarnessResult
 from .claudecode import ClaudeCodeHarness
 from .claweval import ClawEvalHarness
@@ -28,10 +30,11 @@ __all__ = ["Harness", "HarnessFeature", "HarnessResult", "get_harness"]
 # Module-level singletons. Harnesses are stateless w.r.t. tasks — one instance
 # per process is fine and avoids spinning up a new object on every CLI call.
 _REGISTRY: dict[str, Harness] = {
+    "aorchestra": AOrchestraHarness(),
     "claweval":   ClawEvalHarness(),
-    "openclaw":   OpenClawHarness(),
-    "codex":      CodexHarness(),
     "claudecode": ClaudeCodeHarness(),
+    "codex":      CodexHarness(),
+    "openclaw":   OpenClawHarness(),
 }
 
 
