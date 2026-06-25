@@ -333,6 +333,43 @@ def test_build_llms_config_does_not_expose_gemini_alias(claweval_cfg_model):
         cfg.get("gemini-3-flash-preview")
 
 
+def test_build_llms_config_alias_key_tracks_model_id():
+    """Phase 5: the alias dict key is now cfg.model.model_id (not a hardcoded
+    'claude-sonnet-4-5'). Pointing claw-eval at a local vllm server with a
+    different served name (e.g. 'qwen3.6-27b') must produce a working
+    LLMsConfig entry under that exact name."""
+    from claw_eval.harnesses.aorchestra._bridge.model_config import build_llms_config
+
+    qwen_cfg = ModelConfig(
+        model_id="qwen3.6-27b",
+        api_key="EMPTY",
+        base_url="http://localhost:8001/v1",
+    )
+    cfg = build_llms_config(qwen_cfg)
+    primary = cfg.get("qwen3.6-27b")
+    assert primary.base_url == "http://localhost:8001/v1"
+    assert primary.key == "EMPTY"
+    assert primary.model == "qwen3.6-27b"
+    # The old hardcoded entry must NOT exist when a different model_id is used.
+    with pytest.raises(ValueError):
+        cfg.get("claude-sonnet-4-5")
+
+
+def test_build_llms_config_api_key_defaults_to_empty_placeholder():
+    """vllm and some private endpoints don't require an api key; we use the
+    'EMPTY' placeholder (accepted by openai-sdk) when the config omits one."""
+    from claw_eval.harnesses.aorchestra._bridge.model_config import build_llms_config
+
+    no_key_cfg = ModelConfig(
+        model_id="local-model",
+        api_key="",
+        base_url="http://localhost:8001/v1",
+    )
+    cfg = build_llms_config(no_key_cfg)
+    primary = cfg.get("local-model")
+    assert primary.key == "EMPTY"
+
+
 def test_patched_llms_config_restores_default_on_exit(claweval_cfg_model):
     from claw_eval.harnesses.aorchestra._bridge.model_config import patched_llms_config
 
