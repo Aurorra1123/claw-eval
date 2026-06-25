@@ -201,3 +201,92 @@ def test_http_action_non_json_response_passes_through_as_text(ocr_tool_spec, ocr
     assert step_log[0]["status"] == 200
     assert step_log[0]["response"] == "plain text body"
 
+
+
+# ---------------------------------------------------------------------------
+# Task 4: ClawEvalEnv adapter
+# ---------------------------------------------------------------------------
+
+
+from pathlib import Path  # noqa: E402
+
+from claw_eval.models.task import TaskDefinition  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture
+def t077_task():
+    return TaskDefinition.from_yaml(
+        _REPO_ROOT / "tasks" / "T077_officeqa_highest_dept_spending" / "task.yaml"
+    )
+
+
+@pytest.fixture
+def t068_task():
+    return TaskDefinition.from_yaml(
+        _REPO_ROOT / "tasks" / "T068zh_llama_w8a8_cuda_bug" / "task.yaml"
+    )
+
+
+def test_clawevalenv_reset_returns_task_prompt(t077_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    with ClawEvalEnv(t077_task, sandbox_url=None) as env:
+        obs = env.reset()
+        assert obs == t077_task.prompt.text
+
+
+def test_clawevalenv_get_action_space_matches_task_tools(t077_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    with ClawEvalEnv(t077_task, sandbox_url=None) as env:
+        actions = env.get_action_space()
+        names = {a.name for a in actions}
+        assert names == {t.name for t in t077_task.tools}
+
+
+def test_clawevalenv_get_action_space_for_main_and_sub_are_distinct(t077_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    with ClawEvalEnv(t077_task, sandbox_url=None) as env:
+        main_actions = env.get_action_space_for("main")
+        sub_actions = env.get_action_space_for("sub")
+        assert main_actions is not sub_actions
+        assert {a.name for a in main_actions} == {a.name for a in sub_actions}
+
+
+def test_clawevalenv_step_log_starts_empty(t077_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    with ClawEvalEnv(t077_task, sandbox_url=None) as env:
+        assert env.step_log() == []
+
+
+def test_clawevalenv_rejects_sandbox_tools_without_sandbox_url(t068_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+    from claw_eval.harnesses.aorchestra._bridge.actions import SchemaTranslationError
+
+    # T068 declares Bash → must raise when sandbox_url is None
+    with ClawEvalEnv(t068_task, sandbox_url=None) as env:
+        with pytest.raises(SchemaTranslationError):
+            env.get_action_space()
+
+
+def test_clawevalenv_accepts_sandbox_tools_when_sandbox_url_present(t068_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    with ClawEvalEnv(t068_task, sandbox_url="http://sandbox:8080") as env:
+        actions = env.get_action_space()
+        names = {a.name for a in actions}
+        assert names == {t.name for t in t068_task.tools}
+
+
+def test_clawevalenv_use_after_close_raises(t077_task):
+    from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+
+    env = ClawEvalEnv(t077_task, sandbox_url=None)
+    env.__enter__()
+    env.__exit__(None, None, None)
+    with pytest.raises(RuntimeError):
+        env.reset()

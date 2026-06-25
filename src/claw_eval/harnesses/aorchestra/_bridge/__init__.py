@@ -10,8 +10,10 @@ from .actions import (
     make_http_action,
     make_sandbox_action,
 )
+from .env import ClawEvalEnv
 
 __all__ = [
+    "ClawEvalEnv",
     "SANDBOX_ENDPOINTS",
     "SchemaTranslationError",
     "make_http_action",
