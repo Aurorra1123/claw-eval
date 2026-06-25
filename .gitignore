@@ -27,6 +27,10 @@ scratch/
 # Configs (contain API keys and internal endpoints)
 configs/
 
+# Local secrets / env (real keys live here; .env.local.example is committed)
+.env.local
+.env
+
 0325_all_traces/
 0325_general_traces/
 configs_paper/

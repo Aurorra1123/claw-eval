@@ -92,6 +92,26 @@ export SERP_DEV_KEY=... # add this for tasks need real web search.  You can get 
 bash scripts/test_sandbox.sh
 ```
 
+> **Real web search (Novada) — sync vs async.** Novada now ships two backends.
+> Older keys use the legacy `GET https://scraperapi.novada.com/search` (`api_key`
+> query param); **new dashboard keys only work** with the async
+> `POST https://scraper.novada.com/request` (`Authorization: Bearer <key>`), whose
+> organic results live under `data.data.json[0].rest.organic`. Select the backend
+> with `SERP_PROVIDER`. The legacy endpoint answers HTTP 200 with
+> `{"code":402,"msg":"Api Key error..."}` for a new key — this now surfaces as an
+> explicit `error` in the response instead of a silent empty result set.
+>
+> Local runs auto-load `.env.local` (gitignored; see `.env.local.example`). For a
+> new dashboard key:
+>
+> ```bash
+> SERP_PROVIDER=novada_async
+> SERP_API_URL=https://scraper.novada.com/request
+> SERP_DEV_KEY=<novada dashboard key>
+> NOVADA_SCRAPER_NAME=google.com   # MUST be google.com when scraper_id=google_search
+> NOVADA_SCRAPER_ID=google_search
+> ```
+
 > **Note on video fixtures:** Due to file size limits, this GitHub repository does not include video files for video-related tasks. The complete fixtures (including all videos) are available on Hugging Face: [claw-eval/Claw-Eval](https://huggingface.co/datasets/claw-eval/Claw-Eval).
 
 > **Note on grade:** we use **gemini-3-flash** in general and multimodal tasks while **claude opus4.6** for both grader and user-agent in multi_turn tasks!

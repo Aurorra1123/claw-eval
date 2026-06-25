@@ -293,6 +293,18 @@ def web_search(req: SearchRequest) -> dict[str, Any]:
         num = min(req.max_results, 10)
         serp_result = search_serp(query=req.query, num=num, timeout=20)
 
+        # Surface Novada business/transport errors instead of swallowing them
+        # into an empty result set. Do NOT cache or inject error results.
+        serp_error = serp_result.get("error")
+        if serp_error:
+            resp = {
+                "results": [], "total": 0, "query": req.query,
+                "error": serp_error,
+                "status": serp_result.get("status"),
+            }
+            _log_call("/web/search", req.model_dump(), resp)
+            return resp
+
         results = []
         for item in serp_result.get("output", []):
             results.append({

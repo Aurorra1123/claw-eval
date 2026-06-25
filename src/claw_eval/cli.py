@@ -17,6 +17,37 @@ os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 
 
+def _load_dotenv_local() -> None:
+    """Load ``.env.local`` (KEY=VALUE per line) into os.environ.
+
+    Zero-dependency loader so local runs can keep secrets (e.g. SERP_DEV_KEY)
+    out of shell profiles and out of git. Existing env vars always win, so an
+    explicit ``export`` on the command line overrides the file. Searched in
+    CWD first, then the project root (where pyproject.toml lives).
+    """
+    candidates = [
+        Path.cwd() / ".env.local",
+        Path(__file__).resolve().parent.parent.parent / ".env.local",
+    ]
+    seen: set[Path] = set()
+    for env_file in candidates:
+        if env_file in seen or not env_file.is_file():
+            continue
+        seen.add(env_file)
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv_local()
+
+
 def _resolve_task_yaml(task_arg: str) -> Path:
     """Resolve --task to a YAML file path.
 
