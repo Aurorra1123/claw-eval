@@ -14,5 +14,6 @@ See ``docs/superpowers/specs/aorchestra_decision.md`` §1 for the rationale.
 """
 from __future__ import annotations
 
-# AOrchestraHarness is exported by ``aorchestra.harness`` in Wave 4-D (Task 7).
-__all__: list[str] = []
+from .harness import AOrchestraHarness
+
+__all__ = ["AOrchestraHarness"]
