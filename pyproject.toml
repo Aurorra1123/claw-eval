@@ -14,7 +14,18 @@ dependencies = [
 mock = ["fastapi>=0.115", "uvicorn>=0.30", "pypdf", "trafilatura>=1.8", "requests>=2.28"]
 web = ["trafilatura>=1.8", "requests>=2.28"]
 sandbox = ["docker>=7.0"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "respx>=0.21"]
+# AOrchestra extras — see docs/superpowers/specs/aorchestra_decision.md.
+# AOrchestra itself is NOT pip-installable; users must additionally inject
+# its source root on PYTHONPATH or via env var AORCHESTRA_ROOT.
+aorchestra = [
+    "aiofiles>=24.1.0",
+    "litellm>=1.80.0",
+    "loguru>=0.7.3",
+    "PyYAML>=6.0.3",
+    "tiktoken>=0.12.0",
+    "respx>=0.21",
+]
 
 [project.scripts]
 claw-eval = "claw_eval.cli:main"
