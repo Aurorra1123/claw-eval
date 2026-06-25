@@ -262,16 +262,15 @@ class ClawEvalSubAgentRunner:
 
 
 def _build_aorchestra_tool_schemas(env: "ClawEvalEnv") -> Dict[str, Dict[str, Any]]:
-    """Return per-tool JSON Schemas keyed by action name.
+    """Pull JSON Schemas for every task-declared tool from the env wrapper.
 
-    ``PiRuntime._build_descriptors`` reads ``SubAgentSpec.tool_schemas[name]``
-    when present and falls back to a permissive shape otherwise.
-
-    TODO(phase-5-followup): ``ClawEvalEnv``'s action_space is text-only as of
-    Phase 4, so we return ``{}`` and let PiRuntime synthesize permissive
-    descriptors. A follow-up should hand-build (or auto-derive) JSON Schemas
-    for each claw-eval action once we have an action-space inspection helper.
+    PiRuntime needs these so the Pi-side LLM can issue tool calls with the
+    right argument fields; without them it gets a permissive
+    ``additionalProperties: true`` placeholder and calls tools with empty args.
+    Returns ``{}`` if the env doesn't expose ``tool_schemas`` (defensive).
     """
+    if hasattr(env, "tool_schemas") and callable(env.tool_schemas):
+        return env.tool_schemas()
     return {}
 
 

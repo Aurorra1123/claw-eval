@@ -96,6 +96,21 @@ class ClawEvalEnv:
         """Snapshot copy of accumulated step_log records."""
         return list(self._step_log)
 
+    def tool_schemas(self) -> dict[str, dict[str, Any]]:
+        """Return {name: {description, parameters}} for every task-declared tool.
+
+        Used by the AOrchestra harness to plumb tool schemas through SubAgentSpec
+        to PiRuntime, so Pi-side LLM tool calls see proper parameter schemas
+        instead of a permissive placeholder.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for tool in self._task.tools:
+            out[tool.name] = {
+                "description": tool.description or f"Tool {tool.name}",
+                "parameters": tool.input_schema or {"type": "object", "additionalProperties": True},
+            }
+        return out
+
     @property
     def task_id(self) -> str:
         return self._task.task_id
