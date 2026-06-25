@@ -51,6 +51,7 @@ from benchmark.common.env import BasicInfo  # noqa: E402
 from benchmark.common.runner import LevelResult, Runner, StepRecord  # noqa: E402
 
 from aorchestra.main_agent import MainAgent  # noqa: E402
+from aorchestra.runtime import default_registry  # noqa: E402
 from aorchestra.tools.complete import CompleteTool  # noqa: E402
 from aorchestra.tools.delegate import DelegateTaskTool  # noqa: E402
 
@@ -256,6 +257,25 @@ class ClawEvalSubAgentRunner:
 
 
 # ---------------------------------------------------------------------------
+# Tool schema builder (Phase 5 — feeds PiRuntime's LLM-facing descriptors)
+# ---------------------------------------------------------------------------
+
+
+def _build_aorchestra_tool_schemas(env: "ClawEvalEnv") -> Dict[str, Dict[str, Any]]:
+    """Return per-tool JSON Schemas keyed by action name.
+
+    ``PiRuntime._build_descriptors`` reads ``SubAgentSpec.tool_schemas[name]``
+    when present and falls back to a permissive shape otherwise.
+
+    TODO(phase-5-followup): ``ClawEvalEnv``'s action_space is text-only as of
+    Phase 4, so we return ``{}`` and let PiRuntime synthesize permissive
+    descriptors. A follow-up should hand-build (or auto-derive) JSON Schemas
+    for each claw-eval action once we have an action-space inspection helper.
+    """
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Trajectory persistence (mirrors gaia_runner._save_trajectory)
 # ---------------------------------------------------------------------------
 
@@ -372,11 +392,20 @@ async def run_one_task(
     # DelegateTaskTool needs the env, runner, models, and benchmark_type.
     # benchmark_type="gaia" because claw-eval tasks are single-shot Q&A in
     # shape; the GAIA prompt builder doesn't assume a docker container.
+    #
+    # Phase 5: which sub-agent runtime drives the SubAgents? Default stays
+    # "react" (Wave 4-D behaviour). Set CLAWEVAL_AORCHESTRA_RUNTIME=pi to opt
+    # into the Node-side @earendil-works/pi-agent-core worker. We hold off on
+    # flipping the default until the Pi side has cleared T077.
+    runtime_name = os.environ.get("CLAWEVAL_AORCHESTRA_RUNTIME", "react")
     delegate_tool = DelegateTaskTool(
         env=env,
         runner=sub_runner,
         models=sub_models,
         benchmark_type="gaia",
+        runtime_registry=default_registry(),
+        runtime_name=runtime_name,
+        tool_schemas=_build_aorchestra_tool_schemas(env),
     )
     complete_tool = CompleteTool()
     main_tools: List[BaseAction] = [
