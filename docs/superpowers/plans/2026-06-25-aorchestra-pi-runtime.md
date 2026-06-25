@@ -8,15 +8,28 @@
 
 **Tech Stack:** Python 3.11+, pydantic 2.x, AOrchestra repo at `/data2/ruanjianhao/AOrchestra/`, Node 22+, `@earendil-works/pi-agent-core@0.80.2` + `@earendil-works/pi-ai@0.80.2` (npm), `typebox` for tool schemas, JSON-RPC 2.0 over stdio.
 
+### v2 Revision Notes (2026-06-25)
+
+This file was patched in place after a Pi-SDK spike (verified against `@earendil-works/pi-agent-core@0.80.2` + `@earendil-works/pi-ai@0.80.2` extracted under `/tmp/pi-spike/`) and a plan-level self-review. Tasks 1 and 2 had already landed when v2 was authored (commits `4e77f81` and `752cc15` on AOrchestra), so changes that touch their *code* are framed as v2 amendments that ride along on a later commit. The deltas are:
+
+1. **Pi SDK API rewritten against the spike.** `agent.ts` and `tools.ts` were full of guesses; v2 replaces every constructor option, event field path, and tool signature with the real API. The most visible casualty: there is no `noTools` field — the bare `pi-agent-core` `Agent` ships with zero built-in tools, so the worker just passes the AO-Environment-backed list.
+2. **No env mutation in PiRuntime, no env.reset in either runtime.** PiRuntime no longer mutates `env.instruction` (the sub-task is passed via the user prompt over JSON-RPC) and no longer calls `env.reset()`. ReActRuntime keeps its existing `env.instruction` save/restore — its inner ReActAgent reads the field at construction time. Neither runtime calls `env.reset()`; the harness owns env lifecycle and sub-agents inherit env mid-episode.
+3. **Default runtime stays `react`.** `CLAWEVAL_AORCHESTRA_RUNTIME` defaults to `"react"`; Pi is explicit opt-in (`=pi`). Reverses v1's aggressive default.
+4. **`SubAgentSpec.tool_schemas` field added.** A new `tool_schemas: dict[str, dict]` field is added to `SubAgentSpec` so each harness can pass the LLM-facing JSON Schemas through `DelegateTaskTool` to `PiRuntime._build_descriptors`. v1's placeholder `additionalProperties: true` descriptors gave the LLM nothing to call against. Because Task 1 already landed without this field, the field is added during Task 4's commit (with a Task 1 amendment subsection documenting the change).
+5. **Tool descriptors use TypeBox.** Pi tools must declare `parameters` via `Type.Object({...})` from `@earendil-works/pi-ai`. v2 uses `Type.Object({}, { additionalProperties: true })` plus `prepareArguments: (args) => args as never` to bypass TypeBox validation and let AO Environment's `env.step` do the real validation. A JSON-Schema → TypeBox translator is noted as a future-work TODO.
+6. **LLM thinking content surfaced in trace.** `agent.ts` now subscribes to `message_end` and writes the assistant message's full content (including ThinkingContent blocks) into the StepRecord's `raw_response` field, rather than just the tool-call JSON.
+
+Cross-references to specific patches are inlined in the affected task sections below.
+
 ## Global Constraints
 
 - **Implementation site is AOrchestra**, not claw-eval. Almost every file path in this plan begins with `/data2/ruanjianhao/AOrchestra/`. claw-eval is touched in exactly one place: `src/claw_eval/harnesses/aorchestra/_runner.py` switches to pass `runtime_name="pi"` at the end (Task 11). Everything else in claw-eval (`_bridge/`, `_trace_adapter.py`, e2e tests, fixtures) stays as-is.
 - **Don't change AOrchestra's `〈I,C,T,M〉` contract.** Runtime selection is *execution infrastructure*, not part of the four-tuple. It's plumbed as a config field (`subagent_runtime: "react" | "pi"`), not as a fifth tuple member.
 - **No loop-in-loop.** Pi owns the sub-agent step loop end-to-end. AO's `Runner.run()` is bypassed in the Pi path. The seam is `DelegateTaskTool → runtime.run(spec, env)`, not `runtime.step()`.
 - **Step budget enforced server-side.** Pi's max_steps is enforced inside the Python tool-gateway, not relied on from the Pi-side prompt. Once `steps >= spec.max_steps`, the next `tool_call` returns `{"done": true, "termination_reason": "max_steps"}` and Pi terminates.
-- **Pi's built-in tools are forbidden.** Every Node session is created with `noTools: "builtin"` (or for `pi-agent-core` directly: only the explicitly-passed `tools` list). The model never sees `bash` / `read` / `write` / `edit` — only AO-Environment-backed tools.
+- **Pi's `Agent` class ships zero built-in tools by default; the worker passes only the AO-Environment-backed tools list.** Verified against `pi-agent-core@0.80.2` (`Agent` constructor's `initialState.tools` defaults to `[]`; there is no `noTools` field). The model never sees `bash` / `read` / `write` / `edit` — only AO-Environment-backed tools.
 - **All tool execution is sequential.** Both at the Pi `Agent` level (`toolExecution: "sequential"`) and per-tool (`executionMode: "sequential"`). AO Environment state is not concurrency-safe.
-- **`env.reset()` semantics match `benchmark/common/runner.py:Runner.run()` lines 55-59** — `agent.reset(info)` then `env.reset()`. PiRuntime calls these in the same order before the first tool call.
+- **Neither runtime calls `env.reset()`.** The harness (e.g. `benchmark/common/runner.py:Runner.run` for the GAIA flow, or claw-eval's harness for T077) owns env lifecycle and calls `reset` exactly once before the MainAgent starts. Sub-agents inherit env state mid-episode — calling reset from inside `DelegateTaskTool → runtime.run` would clobber the MainAgent's accumulated env state.
 - **Trace schema is AO `StepRecord`**, never raw Pi transcript. PiRuntime converts every Pi `tool_execution_end` event into a `StepRecord(observation, action, reward, raw_response, done, info)` before returning. Existing trace formatters and the claw-eval `_trace_adapter` continue to consume the same dict shape.
 - **AOrchestra source mods continue the "decision-9 style" precedent** — direct edits to `/data2/ruanjianhao/AOrchestra/`. There is no upstream PR. The architectural diff is registered in `/data2/ruanjianhao/claw-eval/docs/superpowers/specs/aorchestra_decision.md` (Task 14).
 - **AORCHESTRA_ROOT env var override** continues to work: `/data2/ruanjianhao/AOrchestra` is the default but tests should respect `os.environ.get("AORCHESTRA_ROOT", ...)`.
@@ -463,7 +476,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/test_base.py -v
 ```
 
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -473,6 +486,34 @@ git add aorchestra/runtime/__init__.py aorchestra/runtime/base.py \
         tests/runtime/__init__.py tests/runtime/conftest.py tests/runtime/test_base.py
 git commit -m "feat(runtime): SubAgentRuntime Protocol + dataclasses + registry"
 ```
+
+### Task 1 v2 Amendment (applied during Task 4)
+
+**Status:** Task 1 already landed at `4e77f81` on AOrchestra without the `tool_schemas` field. v2 adds it during Task 4's code commit (NOT as a separate commit, to keep Wave 5-A clean).
+
+**Field to add to `SubAgentSpec` in `/data2/ruanjianhao/AOrchestra/aorchestra/runtime/base.py`:**
+
+```python
+    tool_schemas: dict[str, dict] = field(default_factory=dict)
+```
+
+Insert after the existing `metadata` field. Updated docstring fragment:
+
+```
+tool_schemas : dict[str, dict]
+    Optional name → JSON-Schema mapping for the LLM-facing tool
+    descriptors. Runtimes that surface tool schemas to the model
+    (e.g. PiRuntime) consume this map; runtimes that re-use AO's
+    in-process tool objects (ReActRuntime) ignore it. Keys must
+    be a subset of the names in ``tools``. Empty by default so
+    callers that don't supply schemas keep working — PiRuntime
+    falls back to a permissive ``additionalProperties: true`` shape
+    for unknown names.
+```
+
+**Where it gets populated:** Task 4 changes `DelegateTaskTool.__init__` to accept a `tool_schemas` argument; `DelegateTaskTool.__call__` plumbs it into `SubAgentSpec(tool_schemas=...)`. Task 9 has the claw-eval harness supply the real mapping (claw-eval's `ClawEvalEnv` action space is text-only per Phase 4, so the helper either translates the action_space text into per-tool schemas OR — for the first cut — passes whatever schema dict the harness already has on hand). Task 7's `_build_descriptors` reads `spec.tool_schemas[name]` when present and falls back to the permissive shape otherwise.
+
+**No new test commit for Task 1 itself** — the field is exercised through `test_delegate_uses_runtime.py` (Task 4) and `test_pi_runtime.py` (Task 7).
 
 ### Task 2: `ReActRuntime` wrapper
 
@@ -890,7 +931,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/ -v
 ```
 
-Expected: 13 passed (8 from Task 1 + 5 here).
+Expected: 14 passed (9 from Task 1 + 5 here).
 
 - [ ] **Step 6: Commit**
 
@@ -993,7 +1034,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/ -v
 ```
 
-Expected: 14 passed.
+Expected: 15 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1005,7 +1046,10 @@ git commit -m "feat(runtime): pre-register ReActRuntime as 'react' on import"
 
 ### Task 4: Wire `DelegateTaskTool` through the runtime registry
 
+> **v2 amendment:** This commit also adds the `SubAgentSpec.tool_schemas: dict[str, dict]` field to `aorchestra/runtime/base.py` (see "Task 1 v2 Amendment" above for the rationale — Task 1 already landed without it). The new field is plumbed through `DelegateTaskTool.__init__(tool_schemas=...)` and consumed by `PiRuntime._build_descriptors` in Task 7.
+
 **Files:**
+- Modify: `/data2/ruanjianhao/AOrchestra/aorchestra/runtime/base.py` (add `tool_schemas` field per Task 1 v2 amendment)
 - Modify: `/data2/ruanjianhao/AOrchestra/aorchestra/tools/delegate.py`
 - Modify: `/data2/ruanjianhao/AOrchestra/aorchestra/runners/gaia_runner.py`
 - Modify: `/data2/ruanjianhao/AOrchestra/aorchestra/runners/terminalbench_runner.py`
@@ -1015,11 +1059,34 @@ git commit -m "feat(runtime): pre-register ReActRuntime as 'react' on import"
 **Interfaces:**
 - Consumes: `SubAgentSpec`, `default_registry()` from Tasks 1 / 3.
 - Produces:
-  - `DelegateTaskTool.__init__` now accepts two new optional keyword arguments:
+  - `aorchestra/runtime/base.py` gains a `tool_schemas: dict[str, dict] = field(default_factory=dict)` field on `SubAgentSpec` (v2 amendment — see Task 1).
+  - `DelegateTaskTool.__init__` now accepts three new optional keyword arguments:
     - `runtime_registry: RuntimeRegistry | None = None` — defaults to `default_registry()` if `None`.
     - `runtime_name: str = "react"` — the registered runtime to use.
+    - `tool_schemas: dict[str, dict] | None = None` — optional name → JSON Schema map, forwarded to the runtime via `SubAgentSpec.tool_schemas`. When `None`, `SubAgentSpec.tool_schemas` is left empty and `PiRuntime` falls back to a permissive shape per tool name.
   - Back-compat: the old `runner` positional arg is still accepted (and stored at `self.runner`) but ignored when `runtime_registry` is provided. This means the three existing runner files (gaia/terminalbench/swebench) keep passing `runner=...` and continue to work unchanged.
-  - `DelegateTaskTool.__call__` no longer creates a sub-agent or calls `runner.run()`. Instead it builds a `SubAgentSpec` from the call's args and delegates to `self._runtime.run(spec, self.env)`. The `_summarize_trace`, env.instruction restore, and result dict assembly stay in `DelegateTaskTool`.
+  - `DelegateTaskTool.__call__` no longer creates a sub-agent or calls `runner.run()`. Instead it builds a `SubAgentSpec` from the call's args (including the stored `tool_schemas`) and delegates to `self._runtime.run(spec, self.env)`. The `_summarize_trace`, env.instruction restore, and result dict assembly stay in `DelegateTaskTool`.
+
+- [ ] **Step 0: Add `SubAgentSpec.tool_schemas` field (Task 1 v2 amendment)**
+
+Edit `/data2/ruanjianhao/AOrchestra/aorchestra/runtime/base.py`. In the `SubAgentSpec` dataclass, append a new field after `metadata`:
+
+```python
+    tool_schemas: dict[str, dict] = field(default_factory=dict)
+```
+
+And extend the docstring with:
+
+```
+    tool_schemas : dict[str, dict]
+        Optional ``{tool_name: json_schema}`` map of LLM-facing parameter
+        schemas. PiRuntime exposes these to Pi's ``Agent`` so the model
+        knows what arguments each tool accepts; ReActRuntime ignores the
+        field. Empty by default — runtimes that need schemas fall back to
+        a permissive shape for unknown tool names.
+```
+
+This unblocks Task 1 v2 (the field was absent in the original Task 1 commit `4e77f81`). No standalone test for the field is required — it's exercised by `test_delegate_uses_runtime.py` below and `test_pi_runtime.py` in Task 7.
 
 - [ ] **Step 1: Write failing test**
 
@@ -1101,6 +1168,13 @@ def test_delegate_uses_named_runtime(patched_summarize):
         benchmark_type="gaia",
         runtime_registry=reg,
         runtime_name="capture",
+        tool_schemas={
+            "ocr_extract_text": {
+                "type": "object",
+                "properties": {"image_path": {"type": "string"}},
+                "required": ["image_path"],
+            },
+        },
     )
 
     out = asyncio.run(tool(
@@ -1122,6 +1196,14 @@ def test_delegate_uses_named_runtime(patched_summarize):
     assert spec.benchmark_type == "gaia"
     assert spec.original_question == "original-task"
     assert spec.max_steps > 0  # populated from the env's max_steps
+    # v2: tool_schemas plumbed through SubAgentSpec
+    assert spec.tool_schemas == {
+        "ocr_extract_text": {
+            "type": "object",
+            "properties": {"image_path": {"type": "string"}},
+            "required": ["image_path"],
+        },
+    }
 
     # Return dict matches the historical shape DelegateTaskTool exposed
     assert out["model"] == "claude-sonnet-4-5"
@@ -1224,6 +1306,7 @@ Replace the entire `__init__` (lines 66-104) with the version below. Also replac
         alias_to_model: Dict[str, str] = None,
         runtime_registry=None,
         runtime_name: str = "react",
+        tool_schemas: Dict[str, Dict] | None = None,
     ):
         """Construct the delegation tool.
 
@@ -1249,6 +1332,11 @@ Replace the entire `__init__` (lines 66-104) with the version below. Also replac
         runtime_name :
             Which runtime to ask the registry for. Defaults to ``"react"``,
             preserving prior behaviour.
+        tool_schemas :
+            Optional ``{tool_name: json_schema}`` mapping forwarded to
+            ``SubAgentSpec.tool_schemas``. PiRuntime consumes this to expose
+            real parameter schemas to the LLM; ReActRuntime ignores it.
+            Defaults to ``None`` (empty map).
         """
         super().__init__()
         self.env = env
@@ -1256,6 +1344,7 @@ Replace the entire `__init__` (lines 66-104) with the version below. Also replac
         self.models = models or []
         self.benchmark_type = benchmark_type
         self.alias_to_model = alias_to_model or {}
+        self._tool_schemas = dict(tool_schemas or {})
 
         # Bind a runtime up-front. We do not look it up per call so changes
         # to the registry mid-run don't surprise the orchestration.
@@ -1322,6 +1411,7 @@ Replace the entire `__init__` (lines 66-104) with the version below. Also replac
             original_question=original_question,
             benchmark_type=self.benchmark_type,
             max_steps=int(max_steps),
+            tool_schemas=dict(self._tool_schemas),
         )
 
         # 3. Resolve the runtime. Surface a clean error if the name is unknown
@@ -1403,7 +1493,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/ -v
 ```
 
-Expected: 17 passed.
+Expected: 18 passed.
 
 ```bash
 cd /data2/ruanjianhao/AOrchestra
@@ -1416,8 +1506,12 @@ Expected: `import ok`.
 
 ```bash
 cd /data2/ruanjianhao/AOrchestra
-git add aorchestra/tools/delegate.py aorchestra/runners/ tests/runtime/test_delegate_uses_runtime.py
-git commit -m "refactor(delegate): route execution through SubAgentRuntime registry"
+git add aorchestra/runtime/base.py aorchestra/tools/delegate.py aorchestra/runners/ tests/runtime/test_delegate_uses_runtime.py
+git commit -m "refactor(delegate): route execution through SubAgentRuntime registry
+
+Includes Task 1 v2 amendment: SubAgentSpec gains tool_schemas field
+(plumbed through DelegateTaskTool(tool_schemas=...) → SubAgentSpec).
+"
 ```
 
 ---
@@ -1538,13 +1632,19 @@ Message types (see `src/protocol.ts`):
 
 All Pi `Agent` runs use:
 
-- `noTools: "builtin"` — Pi's built-in `bash` / `read` / `edit` / `write`
-  tools are disabled (see pitfall #3 in `docs/aopi.md`).
+- The bare `pi-agent-core@0.80.2` `Agent` ships with zero built-in tools by
+  default (`initialState.tools` defaults to `[]` and there is no `noTools`
+  field). Only the AO-Environment-backed tools we pass in `run_start.tool_descriptors`
+  are exposed (pitfall #3 in `docs/aopi.md`).
 - `toolExecution: "sequential"` — AO Environment is stateful; concurrent
   steps would corrupt it (pitfall #4).
 - Step budget enforced by the Python tool gateway — if Python returns
-  `{done: true, termination_reason: "max_steps"}`, the worker finishes the
-  current turn and exits (pitfall #2).
+  `{done: true, termination_reason: "max_steps"}`, the worker's tool sets
+  `terminate: true` on the result so the agent ends after that turn
+  (pitfall #2).
+- Both `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai` are
+  ESM-only. The worker stays ESM (`"type": "module"`, `module: "NodeNext"`).
+  Do not convert to CJS.
 ```
 
 - [ ] **Step 5: Create `protocol.ts`**
@@ -1732,16 +1832,29 @@ Create `/data2/ruanjianhao/AOrchestra/aorchestra/runtime/pi_worker/src/tools.ts`
 /**
  * Bridge tools — every Pi tool round-trips to Python over JSON-RPC.
  *
- * Pi's `customTools` accept a name, description, JSON Schema parameters,
- * and an `execute` function. We synthesize one per `ToolDescriptor` the
- * Python side sent in `run_start`.
+ * Pi's `Agent` accepts a list of `AgentTool` objects with TypeBox-validated
+ * parameters (`@earendil-works/pi-ai`'s `Type.Object({...})`). We synthesize
+ * one per `ToolDescriptor` the Python side sent in `run_start`.
+ *
+ * v2 (spike-validated): the real Pi tool signature is
+ *   `execute(toolCallId, params, signal?, onUpdate?) => Promise<AgentToolResult>`
+ * and the parameters field is a TypeBox `TSchema`, not raw JSON Schema. We
+ * sidestep TypeBox validation entirely by declaring permissive
+ * `Type.Object({}, { additionalProperties: true })` and using
+ * `prepareArguments: (args) => args as never` to pass-through whatever Pi
+ * gave us. AO Environment's `env.step` does the real schema validation.
  *
  * The bridge handle owns the stdio adapter (send + correlated await). When
  * the agent calls a tool, we send a `tool_call` event and await the matching
  * `tool_result`. The `done` flag in the result is the orchestration kill
- * switch — if true, we propagate it via the tool's return so the agent
- * terminates gracefully.
+ * switch — if true, we set `terminate: true` so Pi ends the agent (in
+ * sequential mode this stops the run after the current turn — see
+ * pi-agent-core/types.d.ts:60-64).
  */
+import { Type } from "@earendil-works/pi-ai";
+import type { TSchema, TextContent } from "@earendil-works/pi-ai";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+
 import type { ToolCall, ToolDescriptor, ToolResult } from "./protocol.js";
 
 export interface PythonBridge {
@@ -1756,37 +1869,67 @@ export interface PythonBridge {
 }
 
 /**
- * Build the array of `customTools` that `pi-coding-agent` (or the raw
- * `pi-agent-core` Agent) accepts. We keep the API surface narrow on purpose
- * so we can swap between coding-agent and agent-core later if needed.
+ * Minimal "looks like a Pi `AgentTool`" shape. Exact field list mirrors
+ * `pi-agent-core@0.80.2`'s `AgentTool<TParameters, TDetails>`. We don't
+ * import the concrete type because it's a generic and we lose nothing by
+ * structural typing here.
+ */
+export interface PiToolLike {
+  name: string;
+  label: string;
+  description: string;
+  parameters: TSchema;
+  executionMode: "sequential" | "parallel";
+  prepareArguments?: (args: unknown) => Record<string, unknown>;
+  execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+  ) => Promise<AgentToolResult>;
+}
+
+/**
+ * Build the array of `AgentTool`-shaped objects that `pi-agent-core`'s
+ * `Agent` accepts via `initialState.tools`. Every tool is sequential and
+ * uses the permissive TypeBox schema; AO Environment validates args.
  */
 export function buildPythonBridgeTools(
   descriptors: ToolDescriptor[],
-  bridge: PythonBridge
+  bridge: PythonBridge,
 ): PiToolLike[] {
   return descriptors.map((d) => ({
     name: d.name,
+    label: d.name, // Pi requires a UI label; reusing the tool name is fine.
     description: d.description,
-    parameters: d.parameters,
+    // Bypass TypeBox validation — `additionalProperties: true` matches any
+    // shape; the real schema lives in `d.parameters` for the LLM and AO
+    // Environment validates the call when it comes back to Python.
+    parameters: Type.Object({}, { additionalProperties: true }) as TSchema,
     executionMode: "sequential" as const,
-    execute: async (args: Record<string, unknown>) => {
+    prepareArguments: (args: unknown) => args as Record<string, unknown>,
+    execute: async (
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      _signal?: AbortSignal,
+      _onUpdate?: unknown,
+    ): Promise<AgentToolResult> => {
       const callId = bridge.nextCallId();
       const result = await bridge.callPython({
         type: "tool_call",
         run_id: "", // filled by index.ts before dispatch
         call_id: callId,
         name: d.name,
-        arguments: args as Record<string, unknown>,
+        arguments: params,
       });
 
-      // Return both the text the model sees and the orchestration metadata.
+      const textContent: TextContent = {
+        type: "text",
+        text: result.observation_text,
+      };
+
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: result.observation_text,
-          },
-        ],
+        content: [textContent],
         details: {
           observation: result.observation,
           reward: result.reward,
@@ -1794,30 +1937,14 @@ export function buildPythonBridgeTools(
           info: result.info,
           termination_reason: result.termination_reason ?? null,
         },
-        // `terminate` is honoured by pi-agent-core to end the agent after
-        // this tool call completes (see docs/aopi.md pitfall #2 — orchestration
-        // step budget MUST live server-side; this is the kill switch).
+        // `terminate: true` ends the agent after this tool call in sequential
+        // mode (pi-agent-core/types.d.ts:60-64). Combined with the Python
+        // gateway's step-budget enforcement this is the orchestration kill
+        // switch.
         terminate: result.done,
       };
     },
   }));
-}
-
-/**
- * Minimal "looks like a Pi tool" shape. We avoid importing the concrete type
- * from `@earendil-works/pi-agent-core` because the public API surface
- * shifts between minor versions — the shape we use is stable.
- */
-export interface PiToolLike {
-  name: string;
-  description: string;
-  parameters: Record<string, unknown>;
-  executionMode: "sequential" | "parallel";
-  execute: (args: Record<string, unknown>) => Promise<{
-    content: Array<{ type: "text"; text: string }>;
-    details?: Record<string, unknown>;
-    terminate?: boolean;
-  }>;
 }
 ```
 
@@ -1829,31 +1956,35 @@ Create `/data2/ruanjianhao/AOrchestra/aorchestra/runtime/pi_worker/src/agent.ts`
 /**
  * Drives a Pi Agent end-to-end for one delegated AO sub-agent task.
  *
- * Design (see docs/aopi.md):
+ * Design (see docs/aopi.md and the v2 spike under /tmp/pi-spike/):
  * - Pi owns the agent loop. AO doesn't wrap Pi.step(); the orchestration
  *   step budget is enforced server-side via the tool gateway (which sets
  *   `done: true` once steps_taken reaches max_steps).
- * - All built-in Pi tools are disabled (`noTools: "builtin"`). Only the
- *   tools Python sent in `run_start.tool_descriptors` are exposed.
- * - Sequential tool execution at every level.
+ * - `pi-agent-core@0.80.2`'s `Agent` ships with zero built-in tools by
+ *   default — `initialState.tools` defaults to `[]` and there is no
+ *   `noTools` option. We therefore only need to pass the AO-Environment-
+ *   backed bridge tools.
+ * - Sequential tool execution at every level (`toolExecution: "sequential"`
+ *   on the Agent, `executionMode: "sequential"` per tool).
+ * - The two packages (`pi-agent-core`, `pi-ai`) are ESM-only. The worker
+ *   MUST stay ESM (`"type": "module"` in package.json, `module: NodeNext`
+ *   in tsconfig). Do not convert to CJS.
  *
- * On completion we return a `RunEnd` carrying the trace as StepRecordDict[],
- * which is the shape both the AOrchestra `Runner.run()` `LevelResult.trace`
- * field and claw-eval's `_trace_adapter` already consume.
+ * On completion we return a `RunEnd` carrying the trace as
+ * `StepRecordDict[]`, the shape claw-eval's `_trace_adapter` and
+ * AOrchestra's trace formatters already consume.
  */
 import { Agent } from "@earendil-works/pi-agent-core";
-
 import type {
-  PythonBridge,
-  PiToolLike,
-} from "./tools.js";
+  AgentEvent,
+  ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
+import type { Model } from "@earendil-works/pi-ai";
+
+import type { PythonBridge, PiToolLike } from "./tools.js";
 import { buildPythonBridgeTools } from "./tools.js";
 
-import type {
-  RunEnd,
-  RunStart,
-  StepRecordDict,
-} from "./protocol.js";
+import type { RunEnd, RunStart, StepRecordDict } from "./protocol.js";
 
 export interface RunPiAgentArgs {
   spec: RunStart["spec"];
@@ -1866,15 +1997,7 @@ export interface RunPiAgentArgs {
 export async function runPiAgent(args: RunPiAgentArgs): Promise<RunEnd> {
   const { spec, toolDescriptors, llmEndpoint, bridge, runId } = args;
 
-  const tools = buildPythonBridgeTools(toolDescriptors, bridge);
-  // Stamp the run_id on every tool call the bridge sends back to Python.
-  const wrappedTools = tools.map((t) => ({
-    ...t,
-    execute: async (input: Record<string, unknown>) => {
-      // Pass through to the bridge but capture our run_id when correlating.
-      return t.execute(input);
-    },
-  })) as PiToolLike[];
+  const tools: PiToolLike[] = buildPythonBridgeTools(toolDescriptors, bridge);
 
   const systemPrompt = buildSystemPrompt(spec);
   const userPrompt = buildUserPrompt(spec);
@@ -1887,30 +2010,54 @@ export async function runPiAgent(args: RunPiAgentArgs): Promise<RunEnd> {
   let finishResult: Record<string, unknown> | null = null;
   let terminated = false;
   let lastError: string | null = null;
+  // Holds the most recent assistant message's serialized content, written
+  // into the next tool_execution_end's `raw_response`. Pi emits the LLM
+  // message before the tool execution that consumed it, so this ordering
+  // keeps trace[*].raw_response aligned with the action that followed.
+  let pendingRawResponse: string = "";
+
+  const model: Model<"openai-completions"> = {
+    id: spec.model,
+    name: spec.model,
+    api: "openai-completions",
+    provider: "deepwisdom",
+    baseUrl: llmEndpoint.base_url,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 8192,
+  };
+
+  // OpenAI-compatible endpoints (newapi.deepwisdom.ai) don't need
+  // reasoning/thinking-block routing — keep thinkingLevel off.
+  const thinkingLevel: ThinkingLevel = "off";
 
   const agent = new Agent({
     initialState: {
       systemPrompt,
-      model: resolveModel(spec.model, llmEndpoint),
-      thinkingLevel: "medium",
-      tools: wrappedTools as never, // pi-agent-core uses a structural type
+      model,
+      thinkingLevel,
+      tools,
       messages: [],
-      // Disable Pi's built-in bash/read/edit/write/etc.
-      noTools: "builtin",
-    } as unknown as never,
-    // Pi global tool execution strategy. AO Environment is stateful.
+    },
+    // Pi's `getApiKey` hook receives the provider name and returns the API
+    // key string (or undefined). We route everything through `deepwisdom`.
+    getApiKey: async (_provider: string) => llmEndpoint.api_key,
     toolExecution: "sequential",
-  } as unknown as never);
+  });
 
-  agent.subscribe(async (event: PiAgentEvent) => {
+  const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
     switch (event.type) {
       case "tool_execution_start":
         // Could log; nothing to record yet.
         break;
       case "tool_execution_end": {
-        // Convert to a StepRecord-shaped dict.
-        const tc = event.toolCall ?? {};
-        const result = event.toolResult ?? {};
+        // Convert to a StepRecord-shaped dict (verified field names against
+        // pi-agent-core types.d.ts:360-398: `toolName`, `args`, `result`).
+        const toolName = event.toolName;
+        const toolArgs = event.args ?? {};
+        const result = event.result ?? { content: [], details: {} };
         const details =
           (result.details as Record<string, unknown> | undefined) ?? {};
         const reward =
@@ -1919,27 +2066,49 @@ export async function runPiAgent(args: RunPiAgentArgs): Promise<RunEnd> {
         const info = (details.info as Record<string, unknown>) ?? {};
         trace.push({
           observation: details.observation ?? null,
-          action: { action: tc.name, params: tc.arguments },
+          action: { action: toolName, params: toolArgs },
           reward,
-          raw_response: JSON.stringify(tc),
+          // Use the assistant message content captured at message_end (full
+          // LLM output including any ThinkingContent blocks). Fall back to
+          // the tool-call JSON if no message_end fired yet.
+          raw_response:
+            pendingRawResponse ||
+            JSON.stringify({ name: toolName, arguments: toolArgs }),
           done,
           info,
         });
+        // Consume the pending raw_response — next turn captures fresh.
+        pendingRawResponse = "";
         stepCount += 1;
         if (done) terminated = true;
         break;
       }
-      case "message_end":
-        // Pi reports token usage on message_end; aggregate it.
-        if (event.usage) {
-          inputTokens += event.usage.inputTokens ?? 0;
-          outputTokens += event.usage.outputTokens ?? 0;
-          cost += event.usage.cost ?? 0;
+      case "message_end": {
+        // Token usage lives on the AssistantMessage.usage (pi-ai
+        // types.d.ts:248-263). Sum it into the run totals.
+        const msg = event.message;
+        if (msg?.usage) {
+          inputTokens += msg.usage.input ?? 0;
+          outputTokens += msg.usage.output ?? 0;
+          if (msg.usage.cost) {
+            cost += msg.usage.cost.total ?? 0;
+          }
+        }
+        // Capture the full content for the next tool_execution_end.
+        if (msg?.content) {
+          try {
+            pendingRawResponse = JSON.stringify(msg.content);
+          } catch {
+            pendingRawResponse = "";
+          }
+        }
+        // Pi reports errors via stopReason="error" + errorMessage; there
+        // is no `agent_error` event.
+        if (msg?.stopReason === "error") {
+          lastError = msg.errorMessage ?? "agent error";
         }
         break;
-      case "agent_error":
-        lastError = String(event.error ?? "agent error");
-        break;
+      }
       default:
         break;
     }
@@ -1949,6 +2118,8 @@ export async function runPiAgent(args: RunPiAgentArgs): Promise<RunEnd> {
     await agent.prompt(userPrompt);
   } catch (e: unknown) {
     lastError = e instanceof Error ? e.message : String(e);
+  } finally {
+    unsubscribe();
   }
 
   // Try to extract a finish_result from the last tool call's info, mirroring
@@ -1961,7 +2132,11 @@ export async function runPiAgent(args: RunPiAgentArgs): Promise<RunEnd> {
   }
 
   const status: RunEnd["status"] =
-    lastError != null ? "error" : terminated && finishResult ? "done" : "partial";
+    lastError != null
+      ? "error"
+      : terminated && finishResult
+        ? "done"
+        : "partial";
 
   return {
     type: "run_end",
@@ -1995,38 +2170,6 @@ function buildSystemPrompt(spec: RunStart["spec"]): string {
 
 function buildUserPrompt(spec: RunStart["spec"]): string {
   return spec.instruction;
-}
-
-function resolveModel(
-  modelName: string,
-  endpoint: RunStart["llm_endpoint"],
-): unknown {
-  // The Pi SDK's exact "model" shape varies; we pass an object the runtime
-  // can route to OpenAI-compatible endpoints. If the underlying SDK rejects
-  // it, the run_end event will carry an `agent_error` and Python surfaces it.
-  return {
-    name: modelName,
-    baseUrl: endpoint.base_url,
-    apiKey: endpoint.api_key,
-  };
-}
-
-interface PiAgentEvent {
-  type: string;
-  toolCall?: {
-    name?: string;
-    arguments?: Record<string, unknown>;
-  };
-  toolResult?: {
-    content?: Array<{ type: "text"; text: string }>;
-    details?: Record<string, unknown>;
-  };
-  usage?: {
-    inputTokens?: number;
-    outputTokens?: number;
-    cost?: number;
-  };
-  error?: unknown;
 }
 ```
 
@@ -2257,13 +2400,14 @@ Goal: a Python class that subprocesses the Node worker, sends a `run_start`, ser
   - `class PiRuntime` — concrete `SubAgentRuntime`.
     - Constructor takes optional `node_bin: str = None` (default `os.environ.get("PI_RUNTIME_NODE_BIN", "node")`) and `worker_entrypoint: Path = None` (default the compiled dist path).
     - `async run(spec, env)`:
-      1. Spawn the Node worker as a subprocess (`asyncio.create_subprocess_exec(node_bin, worker_entrypoint, stdin=PIPE, stdout=PIPE, stderr=PIPE)`).
-      2. Build the tool descriptors. Each tool name from `spec.tools` is paired with description + schema. **The required `finish` tool is appended unconditionally** if not already present (so Pi always has a way to stop).
-      3. Resolve the LLM endpoint via `LLMsConfig.default().get(spec.model)` and serialise `base_url` + `api_key` into the `run_start` envelope.
-      4. Write the `run_start` line to the worker's stdin.
-      5. Loop: read one line from the worker's stdout. If `tool_call`, call `_handle_tool_call`, write a `tool_result` line back. If `log`, route to Python logger. If `run_end`, break.
-      6. Wait for the process to exit. Drain stderr into the logger.
-      7. Convert the `RunEnd` payload to `SubAgentRunResult`. Restore `env.instruction` if we touched it.
+      1. Sanity-check the LLM endpoint resolved from `LLMsConfig.default().get(spec.model)` — if `base_url` or `api_key` is empty, return an error result immediately rather than spawning the worker.
+      2. Spawn the Node worker as a subprocess (`asyncio.create_subprocess_exec(node_bin, worker_entrypoint, stdin=PIPE, stdout=PIPE, stderr=PIPE)`).
+      3. Build the tool descriptors via `_build_descriptors(spec)`, which reads `spec.tool_schemas` (Task 4 amendment) for per-tool JSON Schemas. **The required `finish` tool is appended unconditionally** if not already present (so Pi always has a way to stop).
+      4. Serialise the LLM endpoint (`base_url` + `api_key`) into the `run_start` envelope.
+      5. Write the `run_start` line to the worker's stdin.
+      6. Loop: read one line from the worker's stdout. If `tool_call`, call `_handle_tool_call`, write a `tool_result` line back. If `log`, route to Python logger. If `run_end`, break.
+      7. Wait for the process to exit. Drain stderr into the logger.
+      8. Convert the `RunEnd` payload to `SubAgentRunResult`. **v2: PiRuntime does NOT mutate `env.instruction` and does NOT call `env.reset()` — the harness owns env lifecycle.**
     - On any exception: terminate the subprocess (kill if still alive after 2 seconds), return `SubAgentRunResult(status="error", ..., error=str(exc))`.
   - `_handle_tool_call(env, spec, call)` does the step-budget enforcement:
     - Increment a per-run `steps_taken` counter.
@@ -2416,7 +2560,7 @@ def test_pi_runtime_completes_with_finish_tool(tmp_path):
     assert result.output_tokens == 20
     # finish is short-circuited; env.step was NOT called
     assert env.steps_observed == []
-    # env.instruction restored
+    # v2: PiRuntime does not mutate env.instruction (no save/restore).
     assert env.instruction == "original-task"
 
 
@@ -2506,12 +2650,15 @@ Architecture (see /data2/ruanjianhao/claw-eval/docs/aopi.md):
 - Pi owns the agent loop. AO does NOT wrap Pi.step().
 - The orchestration step budget is enforced in this module (the tool
   gateway) — never relied on from a prompt.
-- Pi's built-in tools are disabled in the worker (Task 6 sets
-  ``noTools: "builtin"``).
+- The bare `pi-agent-core@0.80.2` Agent ships with zero built-in tools
+  (`initialState.tools` defaults to `[]`). The worker passes only the
+  AO-Environment-backed tools we send.
 - All tool execution is sequential (worker sets toolExecution / executionMode
   to "sequential").
-- `env.reset()` is called before the first tool_call to match
-  benchmark/common/runner.py:Runner.run() semantics.
+- v2 amendment: PiRuntime does NOT call `env.reset()` and does NOT mutate
+  `env.instruction`. The harness (e.g. `benchmark/common/runner.py:Runner.run`
+  or claw-eval's `_runner.py`) owns env lifecycle; sub-agents inherit env
+  state mid-episode, matching ReActRuntime semantics.
 - Trace returned by PiRuntime is in StepRecord-shaped dicts so existing
   consumers (DelegateTaskTool._summarize_trace, claw-eval _trace_adapter)
   don't need to know which runtime produced it.
@@ -2601,26 +2748,27 @@ class PiRuntime:
                 ),
             )
 
-        # Save env.instruction for restore on exit.
-        original_instruction = getattr(env, "instruction", None)
-        if hasattr(env, "instruction"):
-            env.instruction = spec.instruction
-
-        # Reset env so PiRuntime matches benchmark/common/runner.py semantics.
-        try:
-            reset_result = env.reset()
-            if inspect.isawaitable(reset_result):
-                await reset_result
-        except Exception as exc:  # noqa: BLE001
-            self._restore(env, original_instruction)
-            return SubAgentRunResult(
-                status="error", done=False, steps=0, finish_result=None,
-                trace=[], error=f"env.reset failed: {exc}",
-            )
-
         # Build the run_start envelope.
         run_id = uuid.uuid4().hex
         llm_cfg = LLMsConfig.default().get(spec.model)
+        base_url = getattr(llm_cfg, "base_url", "") or ""
+        api_key = getattr(llm_cfg, "key", "") or ""
+
+        # Sanity check the LLM endpoint up-front — failing here is clearer
+        # than letting the Node worker fail with a cryptic auth error.
+        if not base_url or not api_key:
+            return SubAgentRunResult(
+                status="error",
+                done=False,
+                steps=0,
+                finish_result=None,
+                trace=[],
+                error=(
+                    f"missing llm_endpoint: base_url={base_url or '<empty>'} "
+                    f"api_key={'set' if api_key else 'unset'}"
+                ),
+            )
+
         descriptors = self._build_descriptors(spec)
 
         run_start = {
@@ -2638,8 +2786,8 @@ class PiRuntime:
             },
             "tool_descriptors": descriptors,
             "llm_endpoint": {
-                "base_url": getattr(llm_cfg, "base_url", "") or "",
-                "api_key": getattr(llm_cfg, "key", "") or "",
+                "base_url": base_url,
+                "api_key": api_key,
             },
         }
 
@@ -2704,7 +2852,6 @@ class PiRuntime:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            self._restore(env, original_instruction)
             stderr_task.cancel()
             return SubAgentRunResult(
                 status="error", done=False, steps=steps_taken,
@@ -2717,7 +2864,6 @@ class PiRuntime:
             except ProcessLookupError:
                 pass
             await proc.wait()
-            self._restore(env, original_instruction)
             stderr_task.cancel()
             return SubAgentRunResult(
                 status="error", done=False, steps=steps_taken,
@@ -2730,8 +2876,6 @@ class PiRuntime:
             await asyncio.wait_for(stderr_task, timeout=2.0)
         except asyncio.TimeoutError:
             stderr_task.cancel()
-
-        self._restore(env, original_instruction)
 
         if proc.returncode not in (0, None):
             err = (run_end_payload or {}).get(
@@ -2763,34 +2907,44 @@ class PiRuntime:
         )
 
     @staticmethod
-    def _restore(env: Any, original: Any) -> None:
-        if original is not None and hasattr(env, "instruction"):
-            env.instruction = original
-
-    @staticmethod
     def _build_descriptors(spec: SubAgentSpec) -> list[dict]:
         """One descriptor per tool name + an implicit `finish` descriptor.
 
-        We don't currently know each tool's full JSON Schema from inside
-        DelegateTaskTool — the Spec only carries names. For non-finish
-        tools we emit a permissive ``additionalProperties: true`` shape that
-        Pi will accept; the actual Python ClawEvalAction / GAIA tool will
-        validate the args when env.step dispatches.
+        v2: Reads ``spec.tool_schemas[name]`` when present (populated by
+        ``DelegateTaskTool(tool_schemas=...)`` in Task 4 — the claw-eval
+        harness supplies the dict in Task 9). When a name is absent we fall
+        back to a permissive ``additionalProperties: true`` shape and a
+        synthesized description. The real validation still happens in AO
+        Environment when env.step dispatches.
 
-        TODO: a future revision can have DelegateTaskTool / ClawEvalEnv
-        pass the full schemas. For now permissive shapes are enough to
-        unblock Phase 5.
+        TODO: a future revision can translate the schema into TypeBox on the
+        Node side so the LLM gets full typed validation rather than the
+        bypass via ``prepareArguments``. Out of scope for v2.
         """
         descriptors: list[dict] = []
         seen: set[str] = set()
         for name in spec.tools:
-            descriptors.append({
-                "name": name,
-                "description": f"Tool `{name}` from the task's action space.",
-                "parameters": {
+            schema = spec.tool_schemas.get(name)
+            if schema:
+                description = (
+                    schema.get("description")
+                    or f"Tool `{name}` from the task's action space."
+                )
+                parameters = {k: v for k, v in schema.items() if k != "description"}
+                # If the harness omitted the "type" key on the bare schema,
+                # default to "object" so the JSON-Schema-shaped descriptor is
+                # well-formed before it crosses the wire.
+                parameters.setdefault("type", "object")
+            else:
+                description = f"Tool `{name}` from the task's action space."
+                parameters = {
                     "type": "object",
                     "additionalProperties": True,
-                },
+                }
+            descriptors.append({
+                "name": name,
+                "description": description,
+                "parameters": parameters,
             })
             seen.add(name)
         if "finish" not in seen:
@@ -2960,7 +3114,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/ -v
 ```
 
-Expected: 21 passed.
+Expected: 22 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -3013,14 +3167,14 @@ Expected: `exists: True`.
 
 (The dist directory is in `.gitignore`. Real CI rebuilds it.)
 
-### Task 9: Switch `claw-eval/_runner.py` to pass `runtime_name="pi"`
+### Task 9: Switch `claw-eval/_runner.py` to honour `CLAWEVAL_AORCHESTRA_RUNTIME`
 
 **Files:**
 - Modify: `/data2/ruanjianhao/claw-eval/src/claw_eval/harnesses/aorchestra/_runner.py` (lines around 372-380)
 
 **Interfaces:**
 - Consumes: the refactored `DelegateTaskTool` from Task 4.
-- Produces: claw-eval's MainAgent runs against `PiRuntime` by default.
+- Produces: claw-eval's MainAgent reads the runtime selection from an env var; default is `"react"` (preserves Wave 4-D behaviour), set `CLAWEVAL_AORCHESTRA_RUNTIME=pi` to opt into the new Pi backend.
 
 - [ ] **Step 1: Modify the DelegateTaskTool construction site**
 
@@ -3028,12 +3182,19 @@ Locate the `delegate_tool = DelegateTaskTool(...)` block at approximately line 3
 
 ```python
     # DelegateTaskTool: which sub-agent runtime drives the SubAgents?
-    # Phase 5 default: "pi" (Node-side @earendil-works/pi-agent-core worker).
-    # Override via CLAWEVAL_AORCHESTRA_RUNTIME=react to fall back to the
-    # legacy ReActAgent path while triaging issues.
+    # Default stays "react" (Wave 4-D behaviour). Set
+    # CLAWEVAL_AORCHESTRA_RUNTIME=pi to opt into the Phase 5 Node-side
+    # @earendil-works/pi-agent-core worker. We hold off on flipping the
+    # default until the Pi side has cleared T077.
     from aorchestra.runtime import default_registry
 
-    runtime_name = os.environ.get("CLAWEVAL_AORCHESTRA_RUNTIME", "pi")
+    runtime_name = os.environ.get("CLAWEVAL_AORCHESTRA_RUNTIME", "react")
+    # Per-tool JSON Schemas for the LLM-facing descriptors PiRuntime
+    # synthesizes. ClawEvalEnv's action_space is text-only as of Phase 4,
+    # so we hand-build the most common shapes here. PiRuntime falls back
+    # to a permissive shape for any name we omit.
+    tool_schemas = _build_aorchestra_tool_schemas(env)
+
     delegate_tool = DelegateTaskTool(
         env=env,
         runner=sub_runner,
@@ -3041,8 +3202,11 @@ Locate the `delegate_tool = DelegateTaskTool(...)` block at approximately line 3
         benchmark_type="gaia",
         runtime_registry=default_registry(),
         runtime_name=runtime_name,
+        tool_schemas=tool_schemas,
     )
 ```
+
+Add a small helper `_build_aorchestra_tool_schemas(env)` near the top of the file (or in a sibling module) that returns a `dict[str, dict]` mapping each known action name in claw-eval's GAIA action space to its JSON Schema. For the first cut, return `{}` and let PiRuntime fall back to permissive shapes — this is honest about Phase 4's text-only action space. A follow-up commit can replace the empty dict with hand-built schemas once we have an action-space inspection helper.
 
 Make sure `import os` is already at the top of the file. If not, add it.
 
@@ -3060,7 +3224,7 @@ Expected: 92 passed, 4 skipped (the e2e tests are gated, the placeholder and bri
 ```bash
 cd /data2/ruanjianhao/claw-eval
 git add src/claw_eval/harnesses/aorchestra/_runner.py
-git commit -m "feat(aorchestra): default to PiRuntime (CLAWEVAL_AORCHESTRA_RUNTIME=pi)"
+git commit -m "feat(aorchestra): runtime selectable via CLAWEVAL_AORCHESTRA_RUNTIME (default react)"
 ```
 
 ### Task 10: Run T077 e2e through Pi
@@ -3137,7 +3301,7 @@ cd /data2/ruanjianhao/AOrchestra
 python -m pytest tests/runtime/ -v
 ```
 
-Expected: 21 passed.
+Expected: 22 passed.
 
 - [ ] **Step 2: Make sure existing AOrchestra tests outside `tests/runtime/` still work**
 
@@ -3308,20 +3472,36 @@ One file: `src/claw_eval/harnesses/aorchestra/_runner.py` now reads
    `steps_taken` and forces `done=True` once `>= spec.max_steps`. Prompts
    carry the budget for the model's planning but are never the enforcement
    mechanism.
-3. **Pi built-in tools disabled**: the Node worker sets `noTools: "builtin"`.
-   Only AO-Environment-backed tools are reachable.
+3. **Pi worker only registers AO-Environment-backed tools.** The bare
+   `pi-agent-core@0.80.2` Agent ships with zero built-in tools by default
+   (`initialState.tools` defaults to `[]`; there is no `noTools` field —
+   v2 correction). Only the tool descriptors Python sent are reachable.
 4. **Sequential tool execution**: worker sets `toolExecution: "sequential"`
    at the Agent level and `executionMode: "sequential"` per tool.
-5. **`env.reset()` semantics**: PiRuntime calls `env.reset()` once before the
-   first tool call, matching `benchmark/common/runner.py:Runner.run()`.
+5. **Neither runtime calls `env.reset()`.** Additionally PiRuntime no longer mutates `env.instruction`.
+   The harness (Wave 4-D `_runner.py`, or `benchmark/common/runner.py:Runner.run`
+   for AOrchestra's native flows) owns env lifecycle and calls reset once
+   before the MainAgent starts. Sub-agents inherit env state mid-episode.
+   ReActRuntime keeps its `env.instruction` save/restore because its inner
+   ReActAgent reads it from the env at construction time.
+   (v2 correction: v1 incorrectly called `env.reset` and mutated
+   `env.instruction` inside PiRuntime; both leaked state into the
+   MainAgent.)
 6. **Trace schema unified**: PiRuntime converts `tool_execution_end` events
    to `StepRecord`-shaped dicts before returning, so
    `DelegateTaskTool._summarize_trace`, claw-eval `_trace_adapter`, and
-   AOrchestra trace formatters all consume the same shape.
+   AOrchestra trace formatters all consume the same shape. v2 also pipes
+   the assistant `message_end.message.content` into the StepRecord
+   `raw_response` field so LLM thinking content is preserved in traces.
+7. **Cost data caveat**: ReActRuntime cost figures come from AO's
+   `LLMsConfig`-backed client; PiRuntime cost figures come from
+   `pi-ai`'s per-message usage stream against `deepwisdom`. The accounting
+   is not directly comparable across runtimes — for A/B evaluation rely
+   on `task_score`, not `cost`.
 
 ### Operator notes
 
-- Override runtime: `CLAWEVAL_AORCHESTRA_RUNTIME=react`
+- Select runtime: `CLAWEVAL_AORCHESTRA_RUNTIME=pi` (default is `react`; Pi is opt-in until T077 clears)
 - Override node bin: `PI_RUNTIME_NODE_BIN=/path/to/node`
 - Override AOrchestra source root: `AORCHESTRA_ROOT=/path/to/AOrchestra`
 - Worker must be built: `cd $AORCHESTRA_ROOT/aorchestra/runtime/pi_worker && npm install && npm run build`
@@ -3386,9 +3566,9 @@ Expected: push succeeds (claw-eval has a configured remote per Phase 4 history).
 - `aopi.md` §"几个容易踩的大坑" — explicitly addressed in Task 14's decision log; design enforcement lives in:
   - Pitfall 1 (no loop-in-loop): Task 7's `PiRuntime.run` calls the Pi worker, not `Runner.run`.
   - Pitfall 2 (step budget in gateway): Task 7's `_handle_tool_call` enforces it.
-  - Pitfall 3 (no Pi built-in tools): Task 6's `agent.ts` sets `noTools: "builtin"`.
+  - Pitfall 3 (no Pi built-in tools): Task 6's `agent.ts` only registers AO-Environment-backed tools; the bare `pi-agent-core@0.80.2` Agent ships with zero built-in tools by default (`initialState.tools` defaults to `[]`; there is no `noTools` field — v2 correction).
   - Pitfall 4 (sequential): `agent.ts` Agent uses `toolExecution: "sequential"` and `tools.ts` builds `executionMode: "sequential"`.
-  - Pitfall 5 (env.reset semantics): Task 7's `PiRuntime.run` calls `env.reset()` before the first tool call.
+  - Pitfall 5 (env lifecycle): v2 — neither PiRuntime nor ReActRuntime calls `env.reset()`. PiRuntime additionally does NOT mutate `env.instruction` (the sub-task flows via the JSON-RPC user prompt). ReActRuntime continues to save/restore `env.instruction` because its inner ReActAgent reads it from the env at construction time. (v1 incorrectly had PiRuntime call reset and mutate instruction — both were leaks.)
   - Pitfall 6 (trace schema unification): Task 6's `agent.ts` converts Pi events into `StepRecordDict[]` before sending `run_end`, matching `benchmark/common/runner.py:StepRecord` fields.
 - `aopi.md` §"最合适的 MVP" — overridden by the user's instruction to go directly to T077; explicitly called out in the Global Constraints.
 
@@ -3401,12 +3581,23 @@ Expected: push succeeds (claw-eval has a configured remote per Phase 4 history).
 
 **3. Type consistency:**
 
-- `SubAgentSpec(instruction: str, context: str, tools: list[str], model: str, original_question: str = "", benchmark_type: str = "terminalbench", max_steps: int = 30, metadata: dict[str, Any] = field(default_factory=dict))` — consistent across Tasks 1, 2, 4, 7, 12, and the worker's `RunStart.spec`.
+- `SubAgentSpec(instruction: str, context: str, tools: list[str], model: str, original_question: str = "", benchmark_type: str = "terminalbench", max_steps: int = 30, metadata: dict[str, Any] = field(default_factory=dict), tool_schemas: dict[str, dict] = field(default_factory=dict))` — consistent across Tasks 1 (+ v2 amendment), 2, 4, 7, 12, and the worker's `RunStart.spec`. The `tool_schemas` field is the v2 addition.
 - `SubAgentRunResult(status, done, steps, finish_result, trace, cost, input_tokens, output_tokens, error)` — consistent across Tasks 1, 2, 4, 7, and the worker's `RunEnd`.
 - `RuntimeRegistry.{register, get, names}` — consistent across Tasks 1, 3, 4, 7.
 - StepRecord-shaped dict keys (`observation, action, reward, raw_response, done, info`) — consistent across `agent.ts:trace.push`, `PiRuntime` consumer, and `benchmark/common/runner.py:StepRecord`.
 - JSON-RPC message types `run_start`, `tool_call`, `tool_result`, `log`, `run_end` and their field names — identical in `protocol.ts` and `pi_runtime.py`.
-- `runtime_name` / `runtime_registry` parameter names — identical in Task 4 (`DelegateTaskTool`) and Task 9 (claw-eval `_runner.py`).
+- `runtime_name` / `runtime_registry` / `tool_schemas` parameter names — identical in Task 4 (`DelegateTaskTool`) and Task 9 (claw-eval `_runner.py`).
 - `AORCHESTRA_ROOT`, `PI_RUNTIME_NODE_BIN`, `CLAWEVAL_AORCHESTRA_RUNTIME` env var spellings — consistent across Global Constraints, Tasks 1, 7, 9.
 
-No issues found.
+**4. v2 amendments (deltas from v1):**
+
+- **Spike-validated Pi SDK API.** `agent.ts` and `tools.ts` were rewritten against `pi-agent-core@0.80.2` + `pi-ai@0.80.2` extracted under `/tmp/pi-spike/`. Concrete deltas: `noTools` field removed (it does not exist; bare Agent ships zero tools), `thinkingLevel` changed from `"medium"` to `"off"` for the OpenAI-compatible deepwisdom endpoint, model is now a full `Model<"openai-completions">` object (id/name/api/provider/baseUrl/reasoning/input/cost/contextWindow/maxTokens), API key flows through the Agent's `getApiKey` hook rather than the model object, tool `execute` signature is now `(toolCallId, params, signal?, onUpdate?)`, every tool carries a `label` field, parameters are TypeBox (`Type.Object({}, { additionalProperties: true })` + `prepareArguments` bypass), event field names corrected (`event.toolName`, `event.args`, `event.result.details`, `event.message.usage.{input, output, cost.total}`), `agent_error` event removed (errors live on `message.stopReason === "error"` + `errorMessage`), all `as unknown as never` casts dropped.
+- **`SubAgentSpec.tool_schemas` field (Task 1 amendment, lands in Task 4).** Plumbs `{tool_name: json_schema}` from the harness through `DelegateTaskTool(tool_schemas=...)` to `PiRuntime._build_descriptors`. Replaces v1's placeholder `additionalProperties: true` descriptors that gave the LLM nothing to call against.
+- **No env mutation.** `PiRuntime.run` no longer saves/restores `env.instruction`. The sub-task already flows via the user prompt over JSON-RPC; mutating `env.instruction` risked leaking the sub-task into observations.
+- **No env.reset.** `PiRuntime.run` no longer calls `env.reset()`. The harness owns env lifecycle; the sub-agent inherits env mid-episode (matching ReActRuntime).
+- **`CLAWEVAL_AORCHESTRA_RUNTIME` default `react`.** Pi is now opt-in via explicit `=pi`. v1's "default to pi" was aggressive given the Pi path hadn't yet cleared T077.
+- **LLM thinking content in `raw_response`.** `agent.ts` subscribes to `message_end`, captures the assistant message's full content (including ThinkingContent blocks), and writes that into the next StepRecord's `raw_response` field instead of just the tool-call JSON.
+- **`llm_endpoint` sanity check.** PiRuntime.run rejects empty `base_url` or `api_key` up-front with a structured error rather than letting the Node worker fail with a cryptic auth error.
+- **Expected pytest counts updated.** Task 1 expects 9 (was 8), Task 2 expects 14 (was 13), Task 3 expects 15 (was 14), Task 4 expects 18 (was 17), Task 7 expects 22 (was 21). Task 1 commit landed before counting the protocol-satisfaction smoke test correctly.
+
+No remaining issues from the v2 spike / self-review have gone unaddressed.
