@@ -290,3 +290,64 @@ def test_clawevalenv_use_after_close_raises(t077_task):
     env.__exit__(None, None, None)
     with pytest.raises(RuntimeError):
         env.reset()
+
+
+# ---------------------------------------------------------------------------
+# Task 5: LLMsConfig patch (decision.md revision: single entry only)
+# ---------------------------------------------------------------------------
+
+
+from base.engine.async_llm import LLMsConfig  # noqa: E402
+
+from claw_eval.config import ModelConfig  # noqa: E402
+
+
+@pytest.fixture
+def claweval_cfg_model():
+    return ModelConfig(
+        model_id="claude-sonnet-4-5",
+        api_key="sk-test-12345",
+        base_url="https://newapi.example.com/v1",
+    )
+
+
+def test_build_llms_config_has_primary_entry(claweval_cfg_model):
+    from claw_eval.harnesses.aorchestra._bridge.model_config import build_llms_config
+
+    cfg = build_llms_config(claweval_cfg_model)
+    primary = cfg.get("claude-sonnet-4-5")
+    assert primary.base_url == "https://newapi.example.com/v1"
+    assert primary.key == "sk-test-12345"
+    assert primary.model == "claude-sonnet-4-5"
+
+
+def test_build_llms_config_does_not_expose_gemini_alias(claweval_cfg_model):
+    """Spec decision 9 (gemini alias) was reversed during Wave 4-A — AOrchestra
+    delegate.py was patched to use self.models[0] instead, so we no longer
+    need a gemini entry."""
+    from claw_eval.harnesses.aorchestra._bridge.model_config import build_llms_config
+
+    cfg = build_llms_config(claweval_cfg_model)
+    # Asking for the legacy key should fail outright.
+    with pytest.raises(ValueError):
+        cfg.get("gemini-3-flash-preview")
+
+
+def test_patched_llms_config_restores_default_on_exit(claweval_cfg_model):
+    from claw_eval.harnesses.aorchestra._bridge.model_config import patched_llms_config
+
+    previous = LLMsConfig._default_config
+    with patched_llms_config(claweval_cfg_model) as cfg:
+        assert LLMsConfig._default_config is cfg
+        assert cfg.get("claude-sonnet-4-5").base_url == "https://newapi.example.com/v1"
+    assert LLMsConfig._default_config is previous
+
+
+def test_patched_llms_config_restores_on_exception(claweval_cfg_model):
+    from claw_eval.harnesses.aorchestra._bridge.model_config import patched_llms_config
+
+    previous = LLMsConfig._default_config
+    with pytest.raises(RuntimeError):
+        with patched_llms_config(claweval_cfg_model):
+            raise RuntimeError("simulated crash")
+    assert LLMsConfig._default_config is previous

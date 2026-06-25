@@ -11,11 +11,14 @@ from .actions import (
     make_sandbox_action,
 )
 from .env import ClawEvalEnv
+from .model_config import build_llms_config, patched_llms_config
 
 __all__ = [
     "ClawEvalEnv",
     "SANDBOX_ENDPOINTS",
     "SchemaTranslationError",
+    "build_llms_config",
     "make_http_action",
     "make_sandbox_action",
+    "patched_llms_config",
 ]
