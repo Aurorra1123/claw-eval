@@ -1339,31 +1339,102 @@ def cmd_batch(args: argparse.Namespace) -> None:
         str(d) for d in tasks_dir.iterdir()
         if d.is_dir() and (d / "task.yaml").exists()
     )
-    if args.filter:
-        filt = args.filter.lower()
-        task_dirs = [d for d in task_dirs if filt in d.lower()]
 
-    if args.tag:
-        from .models.task import TaskDefinition as _TD
-        filtered = []
-        for d in task_dirs:
-            td = _TD.from_yaml(Path(d) / "task.yaml")
-            if args.tag in td.tags:
-                filtered.append(d)
-        task_dirs = filtered
-
-    if getattr(args, "range", None):
-        import re as _re
-        _m = _re.match(r"(\d+)-(\d+)$", args.range)
-        if not _m:
-            print(f"[ERROR] Invalid --range format: {args.range}  (expected L-R, e.g. 1-104)")
+    # --task-ids: authoritative selection of an arbitrary, possibly
+    # non-contiguous set of tasks (e.g. T002,T008,T012,T018,T077). It is
+    # mutually exclusive with the other selectors — combining them is almost
+    # always a mistake, so we error loudly rather than silently picking a winner.
+    task_ids_arg = getattr(args, "task_ids", None)
+    if task_ids_arg:
+        conflicting = [
+            name for name, val in (
+                ("--filter", args.filter),
+                ("--tag", args.tag),
+                ("--range", getattr(args, "range", None)),
+            )
+            if val
+        ]
+        if conflicting:
+            print(
+                f"[ERROR] --task-ids is mutually exclusive with "
+                f"{', '.join(conflicting)} — pass only one selection method."
+            )
             sys.exit(1)
-        lo, hi = int(_m.group(1)), int(_m.group(2))
-        def _in_range(d):
+
+        import re as _re
+
+        requested = [tok.strip() for tok in task_ids_arg.split(",") if tok.strip()]
+        if not requested:
+            print("[ERROR] --task-ids was given but contained no task IDs.")
+            sys.exit(1)
+
+        # Build a lookup from both the full dir name (== task_id) and the bare
+        # numeric ID prefix (T002) to the task dir path(s).
+        by_name: dict[str, str] = {}
+        by_numeric: dict[str, list[str]] = {}
+        for d in task_dirs:
             name = Path(d).name
-            m = _re.match(r"T(\d+)", name)
-            return m is not None and lo <= int(m.group(1)) <= hi
-        task_dirs = [d for d in task_dirs if _in_range(d)]
+            by_name[name] = d
+            nm = _re.match(r"(T\d+)", name)
+            if nm:
+                by_numeric.setdefault(nm.group(1), []).append(d)
+
+        selected: list[str] = []
+        not_found: list[str] = []
+        seen: set[str] = set()
+        for tok in requested:
+            match = None
+            if tok in by_name:
+                match = by_name[tok]
+            elif tok in by_numeric:
+                cands = by_numeric[tok]
+                if len(cands) > 1:
+                    print(
+                        f"[ERROR] --task-ids token {tok!r} is ambiguous — matches "
+                        f"{[Path(c).name for c in cands]}. Use the full task-dir name."
+                    )
+                    sys.exit(1)
+                match = cands[0]
+            if match is None:
+                not_found.append(tok)
+            elif match not in seen:
+                seen.add(match)
+                selected.append(match)
+
+        if not_found:
+            print(
+                f"[ERROR] --task-ids: {len(not_found)} requested ID(s) not found "
+                f"in {tasks_dir}: {', '.join(not_found)}"
+            )
+            sys.exit(1)
+
+        task_dirs = selected
+    else:
+        if args.filter:
+            filt = args.filter.lower()
+            task_dirs = [d for d in task_dirs if filt in d.lower()]
+
+        if args.tag:
+            from .models.task import TaskDefinition as _TD
+            filtered = []
+            for d in task_dirs:
+                td = _TD.from_yaml(Path(d) / "task.yaml")
+                if args.tag in td.tags:
+                    filtered.append(d)
+            task_dirs = filtered
+
+        if getattr(args, "range", None):
+            import re as _re
+            _m = _re.match(r"(\d+)-(\d+)$", args.range)
+            if not _m:
+                print(f"[ERROR] Invalid --range format: {args.range}  (expected L-R, e.g. 1-104)")
+                sys.exit(1)
+            lo, hi = int(_m.group(1)), int(_m.group(2))
+            def _in_range(d):
+                name = Path(d).name
+                m = _re.match(r"T(\d+)", name)
+                return m is not None and lo <= int(m.group(1)) <= hi
+            task_dirs = [d for d in task_dirs if _in_range(d)]
 
     # If rerunning errors, only keep the errored task dirs
     if errored_task_ids:
@@ -1809,6 +1880,13 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--filter", default=None, help="Only run tasks matching this substring (e.g. 'en_' or 'T01')")
     p_batch.add_argument("--tag", default=None, help="Only run tasks with this tag (e.g. 'multimodal', 'general')")
     p_batch.add_argument("--range", default=None, help="Only run tasks in numeric ID range (e.g. '1-104')")
+    p_batch.add_argument(
+        "--task-ids", default=None, dest="task_ids", metavar="ID1,ID2,...",
+        help="Run an explicit comma-separated set of tasks, e.g. "
+             "'T002_email_triage,T008_todo_management' or short form 'T002,T008'. "
+             "Authoritative selection — mutually exclusive with --filter/--tag/--range. "
+             "Errors if any requested ID does not exist.",
+    )
     p_batch.add_argument("--parallel", type=int, default=4, help="Number of parallel workers (default: 4)")
     p_batch.add_argument("--model", default=None)
     p_batch.add_argument("--api-key", default=None)
