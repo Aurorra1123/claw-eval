@@ -26,7 +26,7 @@ AO 的 `MainAgent` 在 claw-eval 这条路上**技术上能调业务工具**(`ma
 让 MainAgent 从"纯调度器"变成"会干活的协调者":
 - **简单任务自己执行**(直接调业务工具,省委托开销 + 保留完整上下文)
 - **复杂/纯执行类任务委托 SubAgent**(分解、并行、不同模型分工)
-- **委托时把原题的关键约束/异常提示写进 `context`**,不让 SubAgent 盲做
+- **委托时把跟子任务相关的完整上下文打包进 `context`**(原题隐藏约束、具体数据/发现、验收标准)——SubAgent 是信息孤岛,宁多勿少,不让它盲做
 
 判断"简单 vs 复杂"**由 LLM 自己根据原则决定**(不写死阈值)。
 
@@ -76,38 +76,54 @@ JUDGING SIMPLE vs COMPLEX (you decide):
   delegation round-trip and keeps full context).
 ```
 
-### 4.2 委托时强制传约束
+### 4.2 委托时给 SubAgent 完整任务相关上下文
+
+SubAgent 是**信息孤岛** —— 它只看到 `task_instruction` + MainAgent 写的 `context`,**看不到原题、看不到 MainAgent 的推理、看不到之前的工具返回**(除非 MainAgent 主动传进 context)。所以原则是:**只要跟 SubAgent 要做的任务相关,就尽量都传过去 —— 宁多勿少。**
 
 ```
-WHEN YOU DELEGATE — preserve constraints:
-The sub-agent only sees the task_instruction + context you write. The
-original QUESTION often hides requirements (de-duplication, edge cases,
-anomalies, "exclude X", precise totals). Before delegating:
-1. Re-read the QUESTION for hidden/implicit requirements.
-2. Write them EXPLICITLY into the `context` field — do not assume the
-   sub-agent will re-derive them.
-
-Example context: "The transaction list may contain exact duplicates;
-detect them and EXCLUDE one before submitting. Verify the total excludes
-the duplicate."
+WHEN YOU DELEGATE — GIVE THE SUB-AGENT EVERYTHING IT NEEDS:
+The sub-agent is an information island. It sees ONLY the task_instruction +
+the context you write — NOT the original QUESTION, NOT your reasoning, NOT
+prior tool results unless you pass them. Whatever it needs to do the job
+correctly, you must put in `context`. Be generous, not terse. Include:
+1. The original QUESTION's relevant requirements — especially HIDDEN ones
+   (de-duplication, edge cases, anomalies, "exclude X", exact totals,
+   ordering, formatting constraints).
+2. Concrete data / findings from prior attempts or your own tool calls that
+   the sub-agent will need (IDs, values, names, partial results).
+3. What "done correctly" looks like — the acceptance criteria, output format,
+   any verification the sub-agent should do before finishing.
+Do NOT assume the sub-agent will re-derive anything. If in doubt, include it.
 ```
 
 ### 4.3 输出格式(三选一 JSON)
 
-保留 `GAIAMainAgentPrompt` 的 JSON 输出形态,但加上"直接调业务工具"这一支:
+保留 `GAIAMainAgentPrompt` 的 JSON 输出形态,但加上"直接调业务工具"这一支,并把 `context` 字段的引导改成"完整相关上下文":
 
 ```
 If doing it yourself — call a business tool:
-{ "action": "<business_tool_name>", "reasoning": "...", "params": {...} }
+{ "action": "<exact_tool_name_from_AVAILABLE_TOOLS>",
+  "reasoning": "This is simple enough to do directly because [X]",
+  "params": { ...tool's parameters... } }
 
 If delegating:
-{ "action": "delegate_task", "reasoning": "...",
-  "params": { "task_instruction": "...", "context": "<INCLUDE hidden
-  constraints>", "model": "...", "tools": [...] } }
+{ "action": "delegate_task",
+  "reasoning": "This needs decomposition/multi-step work because [X]",
+  "params": {
+    "task_instruction": "A SPECIFIC, ACTIONABLE subtask",
+    "context": "EVERYTHING the sub-agent needs and cannot see otherwise:
+                relevant requirements from the QUESTION (including hidden
+                constraints like dedup/exclusions/exact totals), concrete
+                data and prior findings (IDs, values), and the acceptance
+                criteria for 'done correctly'. Err on the side of MORE
+                context.",
+    "model": "one of <sub_models>",
+    "tools": ["tool1", "tool2", "..."] } }
 
 If done:
 { "action": "complete", "reasoning": "...", "params": { "answer": "..." } }
 ```
+
 
 注:`MainAgent.step` 的 dispatch 已支持任意 `action_name`(查 `self.tools`),所以 `"action": "finance_submit_report"` 这种会被正确执行。**执行层零改动。**
 
@@ -147,7 +163,7 @@ If done:
 |---|---|
 | LLM 过度自执行,复杂任务也自己干→退化成单 agent | prompt 明确"复杂/多步/需分解→delegate";验证 #3 检查复杂 task 仍委托 |
 | LLM 还是不调业务工具(惯性 delegate) | 输出格式里明确给出"直接调业务工具"的 JSON 样例;AVAILABLE TOOLS 节强调"callable by you" |
-| 委托传约束让 context 变长 → 成本上升 | 约束提示简短(一两句);只在真有隐藏约束时加 |
+| 委托传完整 context 让 token 上升 → 成本上升 | 这是设计上的取舍:宁可多传保证 SubAgent 做对(治 T012 类约束丢失),也不省 token 让它盲做。简单任务本来就不该 delegate(走自执行,无 context 开销)。验证时看成本变化,若失控再权衡。 |
 | 三出口让 MainAgent 决策更难、attempts 变多 | 验证时看 attempts 数;若暴涨则收紧"简单优先自执行"的引导 |
 
 ---
