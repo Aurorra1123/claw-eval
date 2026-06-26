@@ -1,0 +1,20 @@
+# Multimodal smoke config — sonnet via deepwisdom newapi. Judge enabled.
+# Declares image input modality so multimodal (image-input) tasks actually
+# receive the picture (default input_modalities=[text] drops images).
+# Used for the T057 logo-identification multimodal fix rerun.
+model:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  input_modalities: [text, image]
+  context_window: 200000
+
+judge:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  enabled: true
+
+defaults:
+  trace_dir: traces
+  tasks_dir: tasks
