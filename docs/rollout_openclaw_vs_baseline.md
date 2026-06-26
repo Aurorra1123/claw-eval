@@ -1,5 +1,22 @@
 # OpenClaw vs Baseline — per-task harness A/B (same model, sonnet-4-5)
 
+> ⚠️ **JUDGE CONFOUND (added 2026-06-26):** This comparison treats baseline
+> vs OpenClaw as same-model/different-harness, but the JUDGE differs:
+> the baseline's `source_task_score` came through a **gemini regrade** flow
+> (manifest `best_manifest -> gemini_regrade/best_trace_manifest.json`),
+> while our OpenClaw rollout used a **sonnet-as-judge** (`config_concurrency_smoke.yaml`
+> judge `model_id = ${CLAWEVAL_LLM_MODEL}` = sonnet). The AGENT model is the
+> same (claude-sonnet-4-5) on both sides — but rule-based scoring dimensions
+> (keyword match, tool_called, safety gates) are judge-independent, while
+> **llm_judge dimensions (office_qa reasoning_quality, communication quality)
+> carry a judge-model bias**. The office_qa −0.17 "systematic" signal may be a
+> gemini-vs-sonnet judge difference, NOT a harness difference. **To remove this
+> confound, re-grade the baseline traces (shipped in the zip) with our own
+> sonnet judge before drawing final harness conclusions.** Decision (2026-06-26):
+> defer the re-grade until the 3-way (baseline/OpenClaw/AO) data is complete,
+> then unify all scoring under one sonnet judge.
+
+
 **Headline:** over the **47 tasks both sides scored**, baseline avg **0.789** vs OpenClaw avg
 **0.699** — OpenClaw is **−0.090** behind. Win/loss/tie (±0.05): **OpenClaw better on 7,
 baseline better on 16, tie on 24**. The gap is **not** broad — it is concentrated in a handful
