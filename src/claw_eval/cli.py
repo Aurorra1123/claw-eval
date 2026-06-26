@@ -32,9 +32,19 @@ def _resolve_task_yaml(task_arg: str) -> Path:
 
 
 def _resolve_tasks_dir(task_yaml: Path) -> Path:
-    """Given a task YAML path like tasks/T01zh_email_triage/task.yaml, return the tasks/ root dir."""
+    """Given a task YAML path like tasks/T01zh_email_triage/task.yaml, return the tasks/ root dir.
+
+    The path is ``.resolve()``-d first so that a *symlinked* task dir resolves to
+    its real location. Without this, a symlink ``tmp/T002 -> repo/tasks/T002``
+    would make ``task_yaml.parent.parent`` = ``tmp`` (the symlink's parent), and
+    callers that use ``tasks_dir.parent`` as the mock-service CWD would land in
+    ``/tmp`` instead of the repo root — breaking the relative
+    ``python mock_services/.../server.py`` service commands. Resolving makes
+    symlinked task dirs behave identically to real ones; for a non-symlink path
+    ``.resolve()`` only absolutises it, leaving ``parent.parent`` unchanged.
+    """
     # task.yaml is at tasks/<ID>/task.yaml — parent.parent is tasks/
-    return task_yaml.parent.parent
+    return task_yaml.resolve().parent.parent
 
 
 def _make_trace_dir(base_dir: str | Path, model_id: str) -> Path:
