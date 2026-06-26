@@ -428,7 +428,7 @@ async def run_one_task(
 
         # Construct the MainAgent. GAIA prompt builder is the closest match —
         # claw-eval tasks are Q&A with a final answer.
-        from aorchestra.prompts.gaia import GAIAMainAgentPrompt
+        from aorchestra.prompts import ClawEvalMainAgentPrompt
 
         main_agent = MainAgent(
             name="MainAgent",
@@ -436,7 +436,7 @@ async def run_one_task(
             sub_models=sub_models,
             tools=main_tools,
             subagent_tools=[*sub_claweval_tools, complete_tool],
-            prompt_builder=GAIAMainAgentPrompt,
+            prompt_builder=ClawEvalMainAgentPrompt,
             max_attempts=max_attempts,
             benchmark_type="gaia",
             mask_model_names=False,  # we're single-model; aliasing adds noise.
