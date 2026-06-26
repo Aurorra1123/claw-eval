@@ -134,6 +134,11 @@ class SandboxRunner:
             run_kwargs["network_mode"] = "host"
         else:
             run_kwargs["ports"] = {f"{self._config.sandbox_port}/tcp": None}
+            # Bridge mode (macOS compat): let the container reach host services
+            # via host.docker.internal. Built-in on Docker Desktop; on Linux
+            # this maps it to the gateway (needs Docker Engine 20.10+). Harmless
+            # where already resolvable.
+            run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
         container = self._docker.containers.run(**run_kwargs)
 

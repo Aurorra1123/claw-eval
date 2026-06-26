@@ -58,6 +58,37 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 
+def _resolve_bridge_network(
+    env: "dict[str, str]",
+    *,
+    sandbox_port: int,
+    host_sandbox_url: str,
+) -> "tuple[str | None, str]":
+    """Decide bridge-vs-host networking for the openclaw container (macOS compat).
+
+    Returns ``(host_gateway, sandbox_url_for_plugin)``.
+
+    Opt-in via ``CLAWEVAL_SANDBOX_NET=bridge`` (default/empty = host mode):
+
+    - **host mode** (Linux, default): ``(None, host_sandbox_url)`` — no URL
+      rewrite, the bridge plugin reaches both the sandbox server and host mock
+      services via the shared host network. Unchanged behaviour.
+    - **bridge mode** (macOS Docker Desktop): ``("host.docker.internal",
+      "http://localhost:<sandbox_port>")``. Two distinct fixes:
+        * ``host_gateway`` rewrites mock-service URLs so the bridged (non-host)
+          container can still reach host mocks.
+        * the plugin's SANDBOX_TOOLS must target the IN-CONTAINER sandbox port
+          (``localhost:<sandbox_port>``), NOT ``host_sandbox_url`` which is the
+          HOST-mapped port — only valid host-side (probe/snapshot), wrong inside
+          the container. Getting this wrong makes Bash/Read/Write 404.
+    """
+    bridge_mode = str(env.get("CLAWEVAL_SANDBOX_NET", "")).strip().lower() == "bridge"
+    if not bridge_mode:
+        return None, host_sandbox_url
+    return "host.docker.internal", f"http://localhost:{sandbox_port}"
+
+
+
 # OpenClaw 2026.6.x built-in tools that we don't want the LLM to use during a
 # claw-eval task — they let the model bypass the bridge plugin (which is the
 # whole point of evaluating tool use). Derived empirically from the
@@ -253,13 +284,23 @@ class OpenClawHarness:
 
         sandbox_url = sandbox_handle.sandbox_url
 
+        # Bridge network mode (macOS compat, opt-in via CLAWEVAL_SANDBOX_NET=bridge).
+        # See _resolve_bridge_network for the routing rationale. host_sandbox_url
+        # (sandbox_handle.sandbox_url) stays valid host-side for probe/snapshot.
+        host_gateway, bridge_sandbox_url = _resolve_bridge_network(
+            os.environ,
+            sandbox_port=cfg.sandbox.sandbox_port,
+            host_sandbox_url=sandbox_url,
+        )
+
         # ---- 1. Bridge plugin: generate on host, install in container ----
         bridge = _openclaw_bridge.generate_and_install(
             task=task,
             case_dir=raw_dir,
             services_ctx=services_ctx,
             run_id=run_id,
-            sandbox_url=sandbox_url,
+            sandbox_url=bridge_sandbox_url,
+            host_gateway=host_gateway,
             container=sandbox_handle.container,
         )
 

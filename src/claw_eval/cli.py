@@ -474,7 +474,16 @@ def cmd_run(args: argparse.Namespace) -> None:
                         Path(trace_dir) / f"{task.task_id}_{run_id}_raw"
                     )
                     case_dir_mount.mkdir(parents=True, exist_ok=True)
-                    start_kwargs["network_mode"] = "host"
+                    # Network mode: default "host" (Linux). On macOS Docker
+                    # Desktop --network host does not bridge host<->container
+                    # localhost, so opt into bridge + port-mapping +
+                    # host.docker.internal via CLAWEVAL_SANDBOX_NET=bridge.
+                    # Bridge mode: do NOT set network_mode -> SandboxRunner falls
+                    # to port mapping; the bridge plugin reaches host mocks via
+                    # host.docker.internal (rewritten in openclaw harness).
+                    _net = os.environ.get("CLAWEVAL_SANDBOX_NET", "").strip().lower()
+                    if _net != "bridge":
+                        start_kwargs["network_mode"] = "host"
                     start_kwargs["volumes"] = {str(case_dir_mount): str(case_dir_mount)}
                     bridge_log_in_container = case_dir_mount / "raw" / "bridge_traffic.jsonl"
                     start_kwargs["extra_env"] = {

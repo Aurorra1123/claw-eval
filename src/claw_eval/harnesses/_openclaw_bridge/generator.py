@@ -195,6 +195,7 @@ def _resolve_tool_url(
     tool_name: str,
     task: "TaskDefinition",
     sandbox_url: str | None,
+    host_gateway: str | None = None,
 ) -> tuple[str, str]:
     """Return ``(url, method)`` for a bridged tool.
 
@@ -207,6 +208,14 @@ def _resolve_tool_url(
        Use its ``url`` + ``method``.
     3. Neither: raise ``SchemaTranslationError`` (preflight should have
        caught this too, but bridge generation is the last line of defence).
+
+    ``host_gateway`` (bridge network mode — macOS compat): when set, mock
+    service URLs (rule 2) have their host (``localhost`` / ``127.0.0.1``)
+    rewritten to ``host_gateway`` (e.g. ``host.docker.internal``) so a
+    bridge-networked container can still reach host mock services. The port
+    and path are preserved. SANDBOX_TOOL routes (rule 1) are NOT rewritten —
+    they already point at the in-container sandbox server. Default ``None`` =
+    no rewrite (host network mode / Linux), URLs verbatim.
     """
     if tool_name in SANDBOX_TOOL_NAMES:
         if sandbox_url is None:
@@ -222,11 +231,30 @@ def _resolve_tool_url(
 
     for ep in (task.tool_endpoints or []):
         if ep.tool_name == tool_name:
-            return (ep.url, ep.method or "POST")
+            return (_rewrite_host(ep.url, host_gateway), ep.method or "POST")
 
     raise SchemaTranslationError(
         f"tool {tool_name!r} declared without endpoint"
     )
+
+
+def _rewrite_host(url: str, host_gateway: str | None) -> str:
+    """Rewrite a mock URL's host to ``host_gateway`` (bridge mode), preserving
+    scheme/port/path. No-op when ``host_gateway`` is None or the host is not a
+    loopback name."""
+    if not host_gateway:
+        return url
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    host = parts.hostname
+    if host not in ("localhost", "127.0.0.1"):
+        return url
+    netloc = host_gateway
+    if parts.port is not None:
+        netloc = f"{host_gateway}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
 
 
 def compile_plugin_source(
@@ -234,6 +262,7 @@ def compile_plugin_source(
     plugin_id: str | None = None,
     *,
     sandbox_url: str | None = None,
+    host_gateway: str | None = None,
 ) -> str | None:
     """Render the plugin ``src/index.ts`` source.
 
@@ -263,7 +292,9 @@ def compile_plugin_source(
     if plugin_id is None:
         plugin_id = derive_plugin_id(task.task_id, "snapshot")
 
-    tools_block = _render_tools_block(task, sandbox_url=sandbox_url)
+    tools_block = _render_tools_block(
+        task, sandbox_url=sandbox_url, host_gateway=host_gateway
+    )
     template = _INDEX_TS_TEMPLATE.read_text(encoding="utf-8")
     description = (
         f"Generated from task {task.task_id}. "
@@ -281,6 +312,7 @@ def _render_tools_block(
     task: "TaskDefinition",
     *,
     sandbox_url: str | None = None,
+    host_gateway: str | None = None,
 ) -> str:
     """Compile the bridgeable tool table into a comma-separated list of
     ``tool({...})`` calls.
@@ -307,7 +339,7 @@ def _render_tools_block(
             # Re-raise unchanged so preflight can catch the spec-mandated
             # exception type.
             raise
-        url, method = _resolve_tool_url(tool_name, task, sandbox_url)
+        url, method = _resolve_tool_url(tool_name, task, sandbox_url, host_gateway)
         # Cross-reference the endpoint method override (when the route came
         # from task.tool_endpoints) — _resolve_tool_url already returns the
         # right method, but keep this assertion for spec drift safety.
@@ -418,6 +450,7 @@ def generate_and_install(
     run_id: str | None = None,
     skip_subprocess: bool = False,
     sandbox_url: str | None = None,
+    host_gateway: str | None = None,
     container: "Any | None" = None,
 ) -> BridgeHandle:
     """Compile ``task`` into a plugin, install it into an isolated profile.
@@ -506,7 +539,9 @@ def generate_and_install(
 
     try:
         # Step 2 — render plugin sources (sandbox_url flows into TS).
-        _materialise_plugin_dir(task, plugin_dir, plugin_id, sandbox_url=sandbox_url)
+        _materialise_plugin_dir(
+            task, plugin_dir, plugin_id, sandbox_url=sandbox_url, host_gateway=host_gateway
+        )
         # Pre-create the traffic log so plugin code can append to it without
         # an extra ``mkdir`` round-trip on first call.
         traffic_log_path.touch(exist_ok=True)
@@ -548,6 +583,7 @@ def _materialise_plugin_dir(
     plugin_id: str,
     *,
     sandbox_url: str | None = None,
+    host_gateway: str | None = None,
 ) -> None:
     """Lay out the plugin directory: template files + generated ``index.ts``.
 
@@ -571,7 +607,9 @@ def _materialise_plugin_dir(
     shutil.copy2(_RECORDER_TS, src_dir / "recorder.ts")
 
     # Rendered index.ts.
-    source = compile_plugin_source(task, plugin_id=plugin_id, sandbox_url=sandbox_url)
+    source = compile_plugin_source(
+        task, plugin_id=plugin_id, sandbox_url=sandbox_url, host_gateway=host_gateway
+    )
     assert source is not None, "early-return path should have been handled by caller"
     (src_dir / "index.ts").write_text(source, encoding="utf-8")
 

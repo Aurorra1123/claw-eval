@@ -99,6 +99,104 @@ def test_compile_plugin_source_empty_tools_returns_none() -> None:
     assert compile_plugin_source(task) is None
 
 
+# ---------------------------------------------------------------------------
+# host_gateway rewrite (bridge network mode — macOS compat)
+
+
+def test_resolve_tool_url_rewrites_mock_host_when_gateway_set() -> None:
+    """In bridge mode the container can't reach host mock services via
+    localhost, so the mock URL host is rewritten to host.docker.internal
+    (port + path unchanged)."""
+    from claw_eval.harnesses._openclaw_bridge.generator import _resolve_tool_url
+
+    task = _load("T077_officeqa_highest_dept_spending")
+    ep = task.tool_endpoints[0]
+    assert "localhost" in ep.url  # precondition: the fixture uses localhost
+
+    url, _method = _resolve_tool_url(
+        ep.tool_name, task, None, host_gateway="host.docker.internal"
+    )
+    assert "localhost" not in url
+    assert url.startswith("http://host.docker.internal:")
+    # port + path preserved
+    assert url.endswith(ep.url.split("localhost", 1)[1])
+
+
+def test_resolve_tool_url_verbatim_when_gateway_none() -> None:
+    """host_gateway=None (host mode / default) -> URL unchanged. Linux
+    zero-regression guard."""
+    from claw_eval.harnesses._openclaw_bridge.generator import _resolve_tool_url
+
+    task = _load("T077_officeqa_highest_dept_spending")
+    ep = task.tool_endpoints[0]
+    url, _method = _resolve_tool_url(ep.tool_name, task, None, host_gateway=None)
+    assert url == ep.url
+
+
+def test_compile_plugin_source_rewrites_host_in_bridge_mode() -> None:
+    """End-to-end through compile: mock URL host rewritten, SANDBOX url kept."""
+    task = _load("T077_officeqa_highest_dept_spending")
+    src = compile_plugin_source(
+        task,
+        sandbox_url="http://localhost:8080",
+        host_gateway="host.docker.internal",
+    )
+    assert src is not None
+    assert "host.docker.internal:9121" in src
+    assert "localhost:9121" not in src  # mock host fully rewritten
+
+
+def test_compile_plugin_source_host_mode_unchanged() -> None:
+    """No host_gateway -> mock URL verbatim (the existing behavior)."""
+    task = _load("T077_officeqa_highest_dept_spending")
+    src = compile_plugin_source(task)
+    assert src is not None
+    assert "localhost:9121" in src
+    assert "host.docker.internal" not in src
+
+
+# ---------------------------------------------------------------------------
+# bridge network resolution (the in-container sandbox URL decision — R1)
+
+
+def test_resolve_bridge_network_host_mode_default() -> None:
+    """Empty env -> host mode: no gateway, plugin uses the host-mapped url."""
+    from claw_eval.harnesses.openclaw import _resolve_bridge_network
+
+    gw, url = _resolve_bridge_network(
+        {}, sandbox_port=8080, host_sandbox_url="http://localhost:54545"
+    )
+    assert gw is None
+    assert url == "http://localhost:54545"  # host-mapped, unchanged
+
+
+def test_resolve_bridge_network_bridge_mode_uses_in_container_port() -> None:
+    """CLAWEVAL_SANDBOX_NET=bridge -> SANDBOX_TOOLS target the IN-CONTAINER port
+    (localhost:<sandbox_port>), NOT the host-mapped url. This is the R1 fix:
+    using the host-mapped 54545 inside the container would 404 Bash/Read/Write."""
+    from claw_eval.harnesses.openclaw import _resolve_bridge_network
+
+    gw, url = _resolve_bridge_network(
+        {"CLAWEVAL_SANDBOX_NET": "bridge"},
+        sandbox_port=8080,
+        host_sandbox_url="http://localhost:54545",
+    )
+    assert gw == "host.docker.internal"
+    assert url == "http://localhost:8080"  # in-container port, NOT 54545
+
+
+def test_resolve_bridge_network_case_insensitive_and_trimmed() -> None:
+    from claw_eval.harnesses.openclaw import _resolve_bridge_network
+
+    gw, url = _resolve_bridge_network(
+        {"CLAWEVAL_SANDBOX_NET": "  BRIDGE  "},
+        sandbox_port=8080,
+        host_sandbox_url="http://localhost:1",
+    )
+    assert gw == "host.docker.internal"
+    assert url == "http://localhost:8080"
+
+
 def test_compile_plugin_source_is_deterministic() -> None:
     """Same task in -> same source out. Snapshot-style tests will rely on this."""
     task = _load("T077_officeqa_highest_dept_spending")
