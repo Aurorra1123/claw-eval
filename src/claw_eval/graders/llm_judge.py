@@ -58,6 +58,11 @@ Respond with JSON only: {"score": <float>, "reasoning": "<brief explanation>"}
 class LLMJudge:
     """Judge communication quality using an LLM via OpenAI-compatible API."""
 
+    # Marker distinguishing a real judge from the :class:`NoJudge` null-object.
+    # Graders that bypass evaluate() and hit ``judge.client`` directly can guard
+    # on ``getattr(judge, "enabled", True)`` to skip the LLM call when disabled.
+    enabled = True
+
     def __init__(
         self,
         model_id: str = "google/gemini-2.5-flash",
@@ -334,6 +339,11 @@ class NoJudge:
     Methods accept ``*args, **kwargs`` so they are a drop-in regardless of the
     exact argument shape individual graders use.
     """
+
+    # Graders that bypass evaluate() and access ``judge.client`` directly cannot
+    # rely on the evaluate* methods; they can instead guard on
+    # ``getattr(judge, "enabled", True)`` to skip the LLM call when disabled.
+    enabled = False
 
     def __init__(self) -> None:
         self._call_log: list[dict] = []
