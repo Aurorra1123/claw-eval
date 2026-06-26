@@ -1,0 +1,17 @@
+# Concurrency smoke config — sonnet via deepwisdom newapi. Judge disabled.
+# Temporary file for the AOrchestra concurrency investigation; safe to delete.
+model:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  context_window: 200000
+
+judge:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  enabled: true
+
+defaults:
+  trace_dir: traces
+  tasks_dir: tasks
