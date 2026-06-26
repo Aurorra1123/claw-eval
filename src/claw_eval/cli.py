@@ -105,8 +105,17 @@ def _grade_with_optional_params(
 
     Returns (scores, judge_calls) where judge_calls is a list of dicts
     captured from the LLMJudge call log (empty if judge has no logging).
+
+    When ``judge`` is ``None`` (``--no-judge`` or no judge key), it is replaced
+    with a :class:`NoJudge` null-object so graders that call ``judge.evaluate()``
+    unconditionally contribute a neutral 0.0 sub-score instead of crashing with
+    ``AttributeError: 'NoneType' object has no attribute 'evaluate'``.
     """
     from .graders.base import AbstractGrader
+    from .graders.llm_judge import NoJudge
+
+    if judge is None:
+        judge = NoJudge()
 
     if hasattr(judge, "reset_call_log"):
         judge.reset_call_log()
