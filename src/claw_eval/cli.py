@@ -939,7 +939,18 @@ def _run_single_task(
     sandbox_runner = None
     if sandbox_mode:
         from .runner.sandbox_runner import SandboxRunner
-        sandbox_runner = SandboxRunner(cfg.sandbox, image=sandbox_image or cfg.sandbox.image)
+        # Mirror cmd_run's openclaw image default (cli.py:437) so batch and
+        # single-task runs behave identically. Without this, --harness openclaw
+        # in batch mode tries to pull "claw-eval-agent:latest" (the generic
+        # default) instead of the locally-built "claw-eval-agent-openclaw:latest".
+        #
+        # Same default for aorchestra: it doesn't ship its own sandbox image,
+        # and the openclaw image's sandbox-server portion is all aorchestra
+        # actually needs from the container (sandbox tools route through it).
+        resolved_image = sandbox_image or cfg.sandbox.image
+        if harness_name in ("openclaw", "aorchestra") and sandbox_image is None:
+            resolved_image = "claw-eval-agent-openclaw:latest"
+        sandbox_runner = SandboxRunner(cfg.sandbox, image=resolved_image)
 
     # Phase 4 Wave 4-D §4.2 — same asymmetric AOrchestra gate as cmd_run.
     if harness_name == "aorchestra":
@@ -984,7 +995,31 @@ def _run_single_task(
                         env_snapshot = None
                         if sandbox_runner:
                             run_id = f"{task.task_id}-t{i}-p{port_offset}"
-                            handle = sandbox_runner.start_container(run_id=run_id)
+                            # OpenClaw needs host networking + a volume mount of
+                            # the per-task case_dir + the bridge-log env, exactly
+                            # like cmd_run (cli.py). Without these the bridge
+                            # install (docker exec npm install in a host path not
+                            # mounted in the container) fails with rc=127. Under
+                            # concurrency, host networking makes the sandbox server
+                            # bind a fixed port (8080) that would collide across
+                            # workers, so we give each worker a unique sandbox_port
+                            # derived from its port_offset (mock services are
+                            # already offset by apply_port_offset).
+                            start_kwargs: dict = {"run_id": run_id}
+                            _resolved_trace_dir = trace_dir or cfg.defaults.trace_dir
+                            if harness_name == "openclaw":
+                                _case_dir_mount = (
+                                    Path(_resolved_trace_dir) / f"{task.task_id}_{run_id}_raw"
+                                )
+                                _case_dir_mount.mkdir(parents=True, exist_ok=True)
+                                _bridge_log_in_container = _case_dir_mount / "raw" / "bridge_traffic.jsonl"
+                                start_kwargs["network_mode"] = "host"
+                                start_kwargs["volumes"] = {str(_case_dir_mount): str(_case_dir_mount)}
+                                start_kwargs["extra_env"] = {
+                                    "CLAWEVAL_BRIDGE_LOG": str(_bridge_log_in_container),
+                                }
+                                start_kwargs["sandbox_port"] = 8080 + port_offset
+                            handle = sandbox_runner.start_container(**start_kwargs)
                             try:
                                 n_injected = sandbox_runner.inject_files(handle, task, task_dir=task_dir)
                                 expected_files = len(task.sandbox_files) if task.sandbox_files else len(getattr(task.environment, "fixtures", []))

@@ -80,6 +80,7 @@ class SandboxRunner:
         network_mode: str | None = None,
         volumes: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
+        sandbox_port: int | None = None,
     ) -> ContainerHandle:
         """Launch an agent container and wait for the sandbox service.
 
@@ -107,11 +108,21 @@ class SandboxRunner:
             Additional env vars to expose to the container process. Merged
             with the proxy vars (proxy wins on collision because it's
             applied second to match historical behaviour).
+        sandbox_port:
+            Override for the sandbox server port. Defaults to
+            ``sandbox_config.sandbox_port`` (8080). MUST be set to a unique
+            value per concurrent worker when ``network_mode == "host"``,
+            because host networking ignores docker port publishing and the
+            server binds this port directly on the host — a fixed port would
+            collide across parallel containers. We override the container's
+            CMD to bind this port and (in bridged mode) publish that port.
         """
         env: dict[str, str] = {}
         if extra_env:
             env.update(extra_env)
         env.update(self._proxy_env())
+
+        effective_port = int(sandbox_port) if sandbox_port is not None else int(self._config.sandbox_port)
 
         run_kwargs: dict[str, Any] = dict(
             image=self._image,
@@ -128,19 +139,29 @@ class SandboxRunner:
                 for host_path, container_path in volumes.items()
             }
 
+        # Override the image CMD so the in-container sandbox server binds
+        # ``effective_port`` instead of its baked-in default. This is what
+        # lets concurrent host-network workers use distinct ports without a
+        # rebuild. The image CMD is
+        # ``python3 /opt/sandbox/server.py --port 8080 --host 0.0.0.0``.
+        run_kwargs["command"] = [
+            "python3", "/opt/sandbox/server.py",
+            "--port", str(effective_port), "--host", "0.0.0.0",
+        ]
+
         if network_mode == "host":
             # In host network mode docker ignores port publishing; the
             # sandbox server listens directly on the host's port.
             run_kwargs["network_mode"] = "host"
         else:
-            run_kwargs["ports"] = {f"{self._config.sandbox_port}/tcp": None}
+            run_kwargs["ports"] = {f"{effective_port}/tcp": None}
 
         container = self._docker.containers.run(**run_kwargs)
 
         if network_mode == "host":
-            host_port = int(self._config.sandbox_port)
+            host_port = effective_port
         else:
-            host_port = self._get_mapped_port(container)
+            host_port = self._get_mapped_port(container, effective_port)
         sandbox_url = f"http://localhost:{host_port}"
         self._wait_healthy(f"{sandbox_url}/health")
 
@@ -368,10 +389,10 @@ class SandboxRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_mapped_port(self, container) -> int:
+    def _get_mapped_port(self, container, container_port: int | None = None) -> int:
         """Resolve the dynamically-assigned host port for the sandbox service."""
         container.reload()
-        port_key = f"{self._config.sandbox_port}/tcp"
+        port_key = f"{int(container_port) if container_port is not None else self._config.sandbox_port}/tcp"
         bindings = container.ports.get(port_key)
         if not bindings:
             raise RuntimeError(
