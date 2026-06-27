@@ -100,46 +100,30 @@ def _resolve_bridge_network(
 # scaffolding (status display, parallel tool batching). Removing them would
 # trip the embedded-runner "No callable tools remain" guard before the LLM
 # even gets to call the bridge tool.
-_BUILTIN_TOOLS_TO_DENY = [
-    "agents_list",
-    "apply_patch",
-    "browser",
-    "canvas",
-    "create_goal",
-    "cron",
-    "dir_fetch",
-    "dir_list",
-    "document_extract",
-    "edit",
-    "exec",
-    "file_fetch",
-    "file_write",
-    "gateway",
-    "get_goal",
-    "image",
-    "image_generate",
-    "memory_get",
-    "memory_search",
-    "message",
-    "nodes",
-    "pdf",
-    "process",
-    "read",
-    "sessions_history",
-    "sessions_list",
-    "sessions_send",
-    "sessions_spawn",
-    "sessions_yield",
-    "skill_workshop",
-    "subagents",
-    "tts",
-    "update_goal",
-    "update_plan",
-    "video_generate",
-    "web_fetch",
-    "web_search",
-    "write",
+# Minimal scaffolding tools kept callable even under the strict bridge
+# allowlist: ``session_status`` (read-only diagnostic) and
+# ``multi_tool_use.parallel`` (provider-level fan-out convenience). Everything
+# else the agent sees must be a bridge plugin tool — see
+# ``_write_tool_policy_config``. (Replaces the old ``_BUILTIN_TOOLS_TO_DENY``
+# blacklist: an allowlist excludes every builtin by construction, so we no
+# longer enumerate them, and same-named builtins can no longer hijack a bridge
+# tool.)
+_BRIDGE_SCAFFOLDING_TOOLS = [
+    "session_status",
+    "multi_tool_use.parallel",
 ]
+
+# Bridge tool names that COLLIDE with an OpenClaw *managed* tool (not just a
+# plugin tool): the managed implementation wins at dispatch time even when an
+# allowlist makes the same-named bridge tool visible (stderr proof: "web_search
+# is disabled or no provider is available" / web_fetch hitting the real domain).
+# For these we must turn the managed tool OFF via its dedicated config switch so
+# the bridge plugin's same-named tool is the only one that resolves. Maps the
+# colliding bridge tool name -> the ``tools.web.*`` switch path to disable.
+_MANAGED_WEB_TOOL_SWITCHES = {
+    "web_search": ("search",),
+    "web_fetch": ("fetch",),
+}
 
 
 class OpenClawHarness:
@@ -304,7 +288,7 @@ class OpenClawHarness:
             container=sandbox_handle.container,
         )
 
-        # ---- 1b. Seed tools.deny (same as host smoke path) ----
+        # ---- 1b. Seed tools.allow (same as host smoke path) ----
         bridge_tool_names = _openclaw_bridge.generator._bridgeable_tools(task)  # type: ignore[attr-defined]
         config_path = raw_dir / "openclaw.json"
         self._write_tool_policy_config(
@@ -466,7 +450,7 @@ class OpenClawHarness:
             run_id=run_id,
         )
 
-        # ---- 3b. Seed tools.deny so the LLM sees only the bridge tools ----
+        # ---- 3b. Seed tools.allow so the LLM sees only the bridge tools ----
         #
         # Without this, the OpenClaw agent surfaces ~40 built-in tools (read,
         # write, exec, process, pdf, browser, ...) to the model. The §6.5
@@ -477,13 +461,16 @@ class OpenClawHarness:
         # runner will use as ``OPENCLAW_CONFIG_PATH`` (raw_dir/openclaw.json).
         # ``_openclaw_native._build_openclaw_temp_config`` reads this file
         # first, then adds the ``models`` / ``agents`` keys without clobbering
-        # any other top-level fields. So ``tools.deny`` survives the merge.
+        # any other top-level fields. So ``tools.allow`` survives the merge.
         #
-        # Choosing ``deny`` over ``profile=minimal`` + ``allow``: the
-        # ``allow`` mechanism rejects plugin-provided tools in some OpenClaw
-        # 2026.6.x revisions ("No callable tools remain after resolving
-        # explicit tool allowlist"), so the safer escape is to enumerate the
-        # builtins to *exclude* and leave plugin tools untouched.
+        # An ALLOW allowlist (not a deny blacklist): the deny approach could
+        # not isolate a bridge tool whose name collides with a builtin
+        # (web_search / web_fetch) — OpenClaw deny matches by bare name, so
+        # un-denying the collision revived the builtin, which hijacked the call.
+        # An allowlist names the bridge tool directly. (OpenClaw only errors
+        # "No callable tools remain" when NOTHING in the allow list matches a
+        # registered tool; the bridge plugin registers these names by the time
+        # the policy resolves, so they're callable — verified on 2026.6.9.)
         bridge_tool_names = [ep.tool_name for ep in (task.tool_endpoints or [])]
         config_path = raw_dir / "openclaw.json"
         self._write_tool_policy_config(
@@ -634,19 +621,25 @@ class OpenClawHarness:
         bridge_tool_names: list[str],
         bridge_plugin_id: str | None,
     ) -> None:
-        """Seed ``openclaw.json`` with ``tools.deny`` + ``plugins.allow``.
+        """Seed ``openclaw.json`` with ``tools.allow`` + ``plugins.allow``.
 
         Written BEFORE the OpenClaw subprocess starts. The native runner's
         ``_build_openclaw_temp_config`` reads any existing config first and
         only modifies ``models`` / ``agents``, so the ``tools`` / ``plugins``
         keys we seed here survive the merge unchanged.
 
-        ``_BUILTIN_TOOLS_TO_DENY`` is the empirically-derived list of tool
-        names OpenClaw 2026.6.x advertises to the LLM via its bundled
-        plugins. We keep ``session_status`` (read-only diagnostic) and
-        ``multi_tool_use.parallel`` (provider-level convenience) so the
-        agent loop has minimum-viable scaffolding; everything else that
-        could touch the host or web is denied.
+        §6.5 contract: the model's only visible tools during a task ARE the
+        bridge plugin's tools. We enforce this with an ALLOW allowlist —
+        ``bridge_tool_names`` + ``_BRIDGE_SCAFFOLDING_TOOLS`` (session_status,
+        multi_tool_use.parallel) — so every builtin is excluded by construction.
+
+        This replaces an earlier ``tools.deny`` blacklist that had to ``discard``
+        a bridge tool colliding with a builtin name (web_search / web_fetch);
+        because OpenClaw 2026.6.x deny matches by bare tool NAME with no source
+        dimension, un-denying the collision revived the BUILTIN, which hijacked
+        the call (the bridge mock saw nothing). An allowlist has no such
+        collision: it names the bridge tool, and the bridge plugin's tool is the
+        only one that resolves.
         """
         import json as _json
 
@@ -660,15 +653,49 @@ class OpenClawHarness:
                 existing = {}
 
         tools_block = existing.get("tools") if isinstance(existing.get("tools"), dict) else {}
-        existing_deny = tools_block.get("deny") if isinstance(tools_block.get("deny"), list) else []
-        # Union with the canonical builtin list. Allow the caller to extend
-        # via a pre-existing deny list, but never silently drop a builtin
-        # we know we want gone.
-        deny_set = set(existing_deny) | set(_BUILTIN_TOOLS_TO_DENY)
-        # Bridge tools must NOT be in deny — the LLM has to call them.
-        for name in bridge_tool_names:
-            deny_set.discard(name)
-        tools_block["deny"] = sorted(deny_set)
+        existing_allow = tools_block.get("allow") if isinstance(tools_block.get("allow"), list) else []
+        # ALLOW allowlist (not deny blacklist). The §6.5 contract requires the
+        # model's only visible tools to BE the bridge plugin's tools. We list
+        # exactly those (+ minimal scaffolding) so EVERY builtin is excluded —
+        # including one that shares a name with a bridge tool (web_search /
+        # web_fetch). OpenClaw 2026.6.x tools.deny matches by normalized bare
+        # tool NAME with no source dimension, so the old deny+discard approach
+        # could not un-deny a colliding bridge tool without also reviving the
+        # builtin (which then hijacked the call). An allowlist names the bridge
+        # tool directly, so the bridge plugin's web_search is the only one that
+        # resolves. (allow only errors "No callable tools remain" when NOTHING
+        # in the list matches a registered tool — the bridge plugin registers
+        # these names, so they resolve.)
+        allow_set = (
+            set(existing_allow)
+            | set(bridge_tool_names)
+            | set(_BRIDGE_SCAFFOLDING_TOOLS)
+        )
+        tools_block["allow"] = sorted(allow_set)
+        # Drop any stale deny we (or a prior run) may have seeded — under an
+        # allowlist it is redundant, and a deny entry for a bridge tool would
+        # re-introduce the collision we just eliminated.
+        tools_block.pop("deny", None)
+
+        # Disable any OpenClaw *managed* web tool whose name a bridge tool
+        # claims (web_search / web_fetch). An allowlist alone does not stop the
+        # managed implementation from winning dispatch; its dedicated switch
+        # (tools.web.<search|fetch>.enabled=false) does, leaving the bridge
+        # plugin's same-named tool as the only one that resolves. Only touch
+        # tools.web when there is an actual collision (no gratuitous config).
+        web_disables = [
+            switch
+            for name in bridge_tool_names
+            for switch in _MANAGED_WEB_TOOL_SWITCHES.get(name, ())
+        ]
+        if web_disables:
+            web_block = tools_block.get("web") if isinstance(tools_block.get("web"), dict) else {}
+            for switch in web_disables:
+                sub = web_block.get(switch) if isinstance(web_block.get(switch), dict) else {}
+                sub["enabled"] = False
+                web_block[switch] = sub
+            tools_block["web"] = web_block
+
         existing["tools"] = tools_block
 
         # Pre-register the bridge plugin under ``plugins.allow`` so the
