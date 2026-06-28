@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,6 +131,17 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent / "plugin_template"
 _INDEX_TS_TEMPLATE = _TEMPLATE_DIR / "src" / "index.ts.template"
 _RECORDER_TS = _TEMPLATE_DIR / "src" / "recorder.ts"
 _STATIC_FILES = ("package.json", "tsconfig.json")
+_NPM_INSTALL_MAX_ATTEMPTS = 3
+_NPM_INSTALL_RETRY_DELAY_S = 1.0
+_NPM_INSTALL_RETRYABLE_MARKERS = (
+    "econnreset",
+    "network aborted",
+    "network connectivity",
+    "socket hang up",
+    "etimedout",
+    "eai_again",
+    "enotfound",
+)
 
 # `plugin_id` must satisfy OpenClaw's plugin id pattern. We don't have an
 # authoritative regex from the SDK, but the demo plugin uses lowercase
@@ -707,11 +719,36 @@ def _run_install_chain(
                 text=True,
             )
 
+    def _is_retryable_npm_install_error(
+        cmd: list[str], exc: subprocess.CalledProcessError
+    ) -> bool:
+        if list(cmd)[:2] != ["npm", "install"]:
+            return False
+        details = "\n".join(
+            part for part in (exc.stderr, exc.stdout) if isinstance(part, str) and part
+        ).lower()
+        return any(marker in details for marker in _NPM_INSTALL_RETRYABLE_MARKERS)
+
+    def _run_with_retry(cmd: list[str], *, cwd: Path | None = None) -> None:
+        attempt = 1
+        while True:
+            try:
+                _run(cmd, cwd=cwd)
+                return
+            except subprocess.CalledProcessError as exc:
+                if (
+                    attempt >= _NPM_INSTALL_MAX_ATTEMPTS
+                    or not _is_retryable_npm_install_error(cmd, exc)
+                ):
+                    raise
+                time.sleep(_NPM_INSTALL_RETRY_DELAY_S * attempt)
+                attempt += 1
+
     # 1) npm install — pulls TypeBox + the openclaw peer (the latter typically
     #    via the dev dep in package.json; in container builds we expect
     #    openclaw to also be globally installed so plugins build/install can
     #    find the CLI).
-    _run(["npm", "install"], cwd=plugin_dir)
+    _run_with_retry(["npm", "install"], cwd=plugin_dir)
 
     # 2) tsc -> dist/. Plugin SDK consumes the compiled JS via the
     #    ``openclaw.extensions`` field in package.json.

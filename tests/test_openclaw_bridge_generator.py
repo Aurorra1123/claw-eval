@@ -12,6 +12,7 @@ each test function is also runnable as ``python tests/test_openclaw_bridge_gener
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -621,6 +622,73 @@ def test_sandbox_endpoints_aligned_with_dispatcher() -> None:
     assert SANDBOX_ENDPOINTS["Bash"] == "/exec"
     assert SANDBOX_ENDPOINTS["Read"] == "/read"
     assert SANDBOX_ENDPOINTS["Write"] == "/write"
+
+
+def test_run_install_chain_retries_transient_npm_network_error(
+    monkeypatch, tmp_path
+) -> None:
+    """``npm install`` transient network failures should be retried once.
+
+    Real failure seen in smoke: ECONNRESET / ``npm error network aborted``.
+    The rest of the chain should continue once a retry succeeds.
+    """
+    from claw_eval.harnesses._openclaw_bridge import generator as mod
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    calls: list[list[str]] = []
+    npm_attempts = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal npm_attempts
+        calls.append(list(cmd))
+        if list(cmd)[:2] == ["npm", "install"]:
+            npm_attempts += 1
+            if npm_attempts == 1:
+                raise subprocess.CalledProcessError(
+                    1,
+                    cmd,
+                    stderr="npm error code ECONNRESET\nnpm error network aborted\n",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod.time, "sleep", lambda _seconds: None)
+
+    mod._run_install_chain(plugin_dir=plugin_dir, plugin_id="bridge-p1", env={})
+
+    assert npm_attempts == 2
+    assert calls[:2] == [["npm", "install"], ["npm", "install"]]
+    assert ["openclaw", "plugins", "enable", "bridge-p1"] in calls
+
+
+def test_run_install_chain_does_not_retry_non_network_npm_error(
+    monkeypatch, tmp_path
+) -> None:
+    """Non-network npm failures should still fail fast."""
+    from claw_eval.harnesses._openclaw_bridge import generator as mod
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    npm_attempts = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal npm_attempts
+        if list(cmd)[:2] == ["npm", "install"]:
+            npm_attempts += 1
+            raise subprocess.CalledProcessError(
+                1,
+                cmd,
+                stderr="npm error code EJSONPARSE\nnpm error package.json parse failed\n",
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        mod._run_install_chain(plugin_dir=plugin_dir, plugin_id="bridge-p1", env={})
+
+    assert npm_attempts == 1
 
 
 # ---------------------------------------------------------------------------
