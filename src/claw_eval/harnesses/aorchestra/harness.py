@@ -10,8 +10,7 @@ Two execution modes (mirroring the OpenClaw split, but asymmetric):
   SANDBOX_TOOL_NAMES (no Bash/Read/Write/...). The CLI gate refuses the
   sandbox-tool case at the entry point before reaching the harness.
 * **container** (Wave 4-E) — ``sandbox_handle`` provided. Same as host smoke
-  but SANDBOX_TOOL_NAMES bridge to the in-container sandbox server. Not yet
-  implemented; the stub raises ``NotImplementedError``.
+  but SANDBOX_TOOL_NAMES bridge to the in-container sandbox server.
 
 §4.2 asymmetry vs OpenClaw: AOrchestra is OK in host mode when the task has
 no SANDBOX_TOOLS, because it's a Python library (no subprocess to isolate).
@@ -238,10 +237,75 @@ class AOrchestraHarness:
         sandbox_handle: "ContainerHandle",
         services_ctx: "ServiceManager | None",
     ) -> HarnessResult:
-        """Container path — implemented in Wave 4-E (Task 8)."""
-        raise NotImplementedError(
-            "Wave 4-E will implement the container path "
-            "(SANDBOX_TOOL_NAMES bridge to the sandbox server)."
+        """Container path (Wave 4-E).
+
+        Mirror ``_run_host_smoke`` but build the env with the in-container
+        sandbox server's URL so SANDBOX_TOOL_NAMES (and the full SANDBOX_TOOLS
+        set appended by the bridge in container mode) dispatch to that server.
+        Diffs from host smoke:
+
+        * No host-mode sandbox-tool refusal gate — sandbox tools are the point.
+        * ``ClawEvalEnv`` / ``run_one_task`` get ``sandbox_handle.sandbox_url``.
+        * ``env_snapshot=None`` — the CLI owns the container snapshot (it
+          collects it from the sandbox server after the run).
+        """
+        import asyncio
+
+        sandbox_url = sandbox_handle.sandbox_url
+
+        trace_dir = Path(trace_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+
+        case_dir = trace_dir / f"{task.task_id}_{run_id}_raw"
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- 1-2. Patch LLMsConfig + open ClawEvalEnv + run MainAgent ----
+        # Lazy import so the heavy AOrchestra-LLM stack only loads when the
+        # harness is actually invoked.
+        from . import _runner
+
+        with patched_llms_config(cfg.model):
+            with ClawEvalEnv(task, sandbox_url=sandbox_url) as env:
+                raw = asyncio.run(
+                    _runner.run_one_task(
+                        task,
+                        env,
+                        cfg,
+                        case_dir=case_dir,
+                        sandbox_url=sandbox_url,
+                    )
+                )
+                # Persist the bridge step_log so the trace adapter can read it.
+                # We snapshot inside the env's lifetime to capture every record.
+                step_log_path = case_dir / "step_log.jsonl"
+                self._write_step_log(env, step_log_path)
+
+        # ---- 3. Audit data from mock services (still alive on host) ----
+        audit_data = self._collect_audit(task, services_ctx)
+
+        # ---- 4. env_snapshot — owned by the CLI for the container path ----
+        # The CLI collects the workdir snapshot from the sandbox server after
+        # the run, so the harness returns None here (vs host smoke which has the
+        # task's fixtures in-process).
+        env_snapshot = None
+
+        # ---- 5. Translate trajectory + step_log + audit into trace JSONL ----
+        trace_path = translate_aorchestra(
+            trajectory_path=raw["trajectory_path"],
+            step_log_path=step_log_path,
+            audit_data=audit_data,
+            task=task,
+            run_id=run_id,
+            trace_dir=trace_dir,
+            duration_ms=raw["duration_ms"],
+            status=raw["status"],
+        )
+
+        return HarnessResult(
+            trace_path=trace_path,
+            env_snapshot=env_snapshot,
+            audit_data=audit_data,
+            raw_dir=case_dir,
         )
 
     # ------------------------------------------------------------------
