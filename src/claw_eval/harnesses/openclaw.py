@@ -625,9 +625,58 @@ class OpenClawHarness:
         # we know we want gone.
         deny_set = set(existing_deny) | set(_BUILTIN_TOOLS_TO_DENY)
         # Bridge tools must NOT be in deny — the LLM has to call them.
+        # ``tools.deny`` is matched by NAME and is source-agnostic in OpenClaw
+        # 2026.6.x: denying ``web_search`` would kill BOTH the builtin and the
+        # bridge plugin tool of that name. So a bridge tool that collides with
+        # a builtin name (``web_search``/``web_fetch``) must be discarded from
+        # deny here — otherwise the LLM can't call the bridge tool at all.
         for name in bridge_tool_names:
             deny_set.discard(name)
         tools_block["deny"] = sorted(deny_set)
+
+        # ---- Name-collision fix for web_search / web_fetch ----
+        #
+        # OpenClaw 2026.6.x ships BUILTIN ``web_search``/``web_fetch`` core
+        # tools that hit the LIVE internet. The bridge plugin registers tools
+        # with the SAME raw names, routed to the task's mock service. When both
+        # exist, the builtin WINS the name-collision dedup: builtins are
+        # registered first (their names seed ``existingToolNames``), then a
+        # plugin tool whose normalized name already exists is silently dropped
+        # (``dist/tools-*.js`` resolveOpenClawPluginToolsForOptions). Net effect
+        # before this fix: the bridge web_search/web_fetch were never exposed,
+        # the builtins fired, and the agent tried to resolve fictional mock
+        # domains on the real internet (getaddrinfo ENOTFOUND / Cloudflare 403),
+        # tanking web-task scores while ``bridge_traffic.jsonl`` showed 0 calls.
+        #
+        # We cannot fix this via ``tools.deny`` (name-based -> kills the bridge
+        # tool too) nor ``plugins.deny`` (the builtins are CORE tools, not owned
+        # by a deniable provider plugin). The correct lever is the core web-tool
+        # enable flags: setting ``tools.web.{search,fetch}.enabled = false`` makes
+        # ``createWebSearchTool``/``createWebFetchTool`` return ``null``, so the
+        # builtin names are never seeded into the dedup set and the bridge's
+        # same-named tools survive and become the sole resolvers. Per the
+        # OpenClaw docs this also disables the native OpenAI/Codex web_search
+        # path, so it covers OpenAI-compatible proxy base URLs too.
+        #
+        # Scoped to the colliding names only: if the task doesn't declare a
+        # web_search/web_fetch bridge tool we leave OpenClaw's web config alone.
+        bridge_name_set = set(bridge_tool_names)
+        _WEB_BUILTIN_TO_DISABLE = {"web_search": "search", "web_fetch": "fetch"}
+        web_keys_to_disable = {
+            web_key
+            for tool_name, web_key in _WEB_BUILTIN_TO_DISABLE.items()
+            if tool_name in bridge_name_set
+        }
+        if web_keys_to_disable:
+            web_block = (
+                tools_block.get("web") if isinstance(tools_block.get("web"), dict) else {}
+            )
+            for web_key in web_keys_to_disable:
+                sub = web_block.get(web_key) if isinstance(web_block.get(web_key), dict) else {}
+                sub["enabled"] = False
+                web_block[web_key] = sub
+            tools_block["web"] = web_block
+
         existing["tools"] = tools_block
 
         # Pre-register the bridge plugin under ``plugins.allow`` so the
