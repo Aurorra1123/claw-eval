@@ -39,16 +39,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# claw-eval Python deps + sandbox server runtime (TUNA mirror).
+# claw-eval sandbox server deps — use the SAME requirements file the original
+# Dockerfile.agent uses, so the image never drifts from the server's real
+# dependency set (Pillow / pdf2image / opencv-python-headless for media + PDF
+# + video frame extraction). Plus the extra packages the OpenClaw bridge path
+# needs (pypdf / pyyaml / httpx). TUNA mirror for domestic acceleration.
+COPY requirements-sandbox-server.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
         --trusted-host pypi.tuna.tsinghua.edu.cn \
-        fastapi \
-        uvicorn \
-        pydantic \
+        -r /tmp/requirements.txt \
         pypdf \
         pyyaml \
-        httpx
+        httpx \
+    && rm /tmp/requirements.txt
+
+# Playwright + Chromium for browser screenshot/recording support — required by
+# tasks whose grader renders the agent's output.html and screenshots it
+# (take_recording.py). Mirrors Dockerfile.agent:37-40. Without this, visual /
+# webpage-reproduction tasks (e.g. M007) produce no grading frames, the grader
+# gets zero screenshots, completion scores 0 and the judge is never called.
+RUN pip install playwright --no-cache-dir --break-system-packages \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        --trusted-host pypi.tuna.tsinghua.edu.cn \
+    && playwright install --with-deps chromium
 
 # OpenClaw CLI (npm installs globally so docker exec finds it on PATH).
 RUN npm install -g openclaw
