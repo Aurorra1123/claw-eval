@@ -275,11 +275,18 @@ def test_clawevalenv_rejects_sandbox_tools_without_sandbox_url(t068_task):
 
 def test_clawevalenv_accepts_sandbox_tools_when_sandbox_url_present(t068_task):
     from claw_eval.harnesses.aorchestra._bridge.env import ClawEvalEnv
+    from claw_eval.runner.sandbox_tools import SANDBOX_TOOL_NAMES
 
     with ClawEvalEnv(t068_task, sandbox_url="http://sandbox:8080") as env:
         actions = env.get_action_space()
         names = {a.name for a in actions}
-        assert names == {t.name for t in t068_task.tools}
+        # Container mode (sandbox_url set): the action space is the task's
+        # declared tools PLUS the full SANDBOX_TOOLS set (deduped), giving the
+        # agent toolset parity with the baseline. Using a set comparison also
+        # proves there are no duplicate actions for tools the task declares.
+        assert names == {t.name for t in t068_task.tools} | set(SANDBOX_TOOL_NAMES)
+        # No action is emitted twice (dedup against task-declared names).
+        assert len([a.name for a in actions]) == len(names)
 
 
 def test_clawevalenv_use_after_close_raises(t077_task):

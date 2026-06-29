@@ -29,7 +29,7 @@ if _AORCHESTRA_ROOT not in sys.path:
 from base.agent.base_action import BaseAction  # noqa: E402
 
 from ....models.task import TaskDefinition
-from ....runner.sandbox_tools import SANDBOX_TOOL_NAMES
+from ....runner.sandbox_tools import SANDBOX_TOOL_NAMES, SANDBOX_TOOLS
 from .actions import (
     SchemaTranslationError,
     make_http_action,
@@ -228,6 +228,20 @@ class ClawEvalEnv:
                     )
                 actions.append(make_http_action(
                     tool, endpoint, self._step_log,
+                    agent_role=agent_role,
+                ))
+        # Container mode: expose the full SANDBOX_TOOLS set (Bash/Read/Write/
+        # Edit/Glob/Grep/...) so the agent has toolset parity with the
+        # baseline. Only when sandbox_url is set (host mode has none and still
+        # refuses sandbox tools at the gate above). Dedup against task-declared
+        # tool names — mirrors runner/loop.py:261-268.
+        if self._sandbox_url:
+            declared = {tool.name for tool in self._task.tools}
+            for spec in SANDBOX_TOOLS:
+                if spec.name in declared:
+                    continue
+                actions.append(make_sandbox_action(
+                    spec, self._sandbox_url, self._step_log,
                     agent_role=agent_role,
                 ))
         return actions
