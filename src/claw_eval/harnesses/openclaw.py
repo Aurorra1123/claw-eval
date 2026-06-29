@@ -258,6 +258,15 @@ class OpenClawHarness:
         trace_dir.mkdir(parents=True, exist_ok=True)
         task_dir = self._task_dir(task)
 
+        # Inject the full SANDBOX_TOOLS set (deduped), mirroring the original
+        # loop's container-mode behaviour (runner/loop.py:294-302). Without
+        # this, a task declaring no tools (e.g. multimodal `tools: []`) yields an
+        # empty bridgeable set and the agent has no read/write/ReadMedia tool.
+        # Done here so every downstream use (bridge generation, allowlist, run,
+        # snapshot, audit) sees the same injected tool set. task_dir was already
+        # resolved from the original task above (path is unaffected by tools).
+        task = self._inject_sandbox_tools(task)
+
         # Case scratch dir + raw subdir. The host harness mounts case_dir at
         # the same path inside the container (see CLI / e2e test) so
         # everything under ``raw_dir`` is visible on both sides.
@@ -613,6 +622,30 @@ class OpenClawHarness:
                 copied, len(file_list), work_dir,
             )
         return work_dir
+
+    @staticmethod
+    def _inject_sandbox_tools(task: "TaskDefinition") -> "TaskDefinition":
+        """Append the full SANDBOX_TOOLS set to ``task.tools`` (deduped by name).
+
+        Mirrors the original claw-eval loop's container-mode behaviour
+        (``runner/loop.py:294-302``): when running in the sandbox container it
+        unconditionally appends every SANDBOX_TOOL (Bash / Read / Write / Edit /
+        Glob / Grep / BrowserScreenshot / ReadMedia / Download), skipping any
+        whose name the task already declares, and routes them to the in-container
+        sandbox server. The adapter previously skipped this step, so a task
+        declaring no tools (e.g. multimodal ``tools: []``) ended up with an empty
+        bridgeable set and the agent had no read/write/media tool at all.
+
+        Returns a copy (``model_copy``); the original task is left unmutated so
+        grading / snapshot paths that read it elsewhere see the declared tools.
+        """
+        from ..runner.sandbox_tools import SANDBOX_TOOLS
+
+        existing = {t.name for t in (task.tools or [])}
+        injected = [t for t in SANDBOX_TOOLS if t.name not in existing]
+        if not injected:
+            return task
+        return task.model_copy(update={"tools": list(task.tools or []) + injected})
 
     @staticmethod
     def _write_tool_policy_config(
