@@ -58,6 +58,11 @@ Respond with JSON only: {"score": <float>, "reasoning": "<brief explanation>"}
 class LLMJudge:
     """Judge communication quality using an LLM via OpenAI-compatible API."""
 
+    # Marker distinguishing a real judge from the :class:`NoJudge` null-object.
+    # Graders that bypass evaluate() and hit ``judge.client`` directly can guard
+    # on ``getattr(judge, "enabled", True)`` to skip the LLM call when disabled.
+    enabled = True
+
     def __init__(
         self,
         model_id: str = "google/gemini-2.5-flash",
@@ -307,6 +312,58 @@ class LLMJudge:
                 print(f"[judge-visual-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+    def get_call_log(self) -> list[dict]:
+        return list(self._call_log)
+
+    def reset_call_log(self) -> None:
+        self._call_log.clear()
+
+
+class NoJudge:
+    """Null-object substitute for ``LLMJudge`` when the judge is disabled.
+
+    When a run uses ``--no-judge`` (or no judge API key is configured), graders
+    that call ``judge.evaluate()`` / ``judge.evaluate_actions()`` /
+    ``judge.evaluate_visual()`` would otherwise crash with
+    ``AttributeError: 'NoneType' object has no attribute 'evaluate'``.
+
+    Substituting this null object for ``None`` at the single grading chokepoint
+    (``_grade_with_optional_params``) makes every judge-dependent component
+    contribute a **neutral 0.0** sub-score instead of crashing. 0.0 (not a
+    passing score) is the safe choice: a judge-scored dimension that could not
+    be evaluated should not silently pass. The neutral evaluation is recorded in
+    the call log (with ``"no_judge": True``) so downstream tooling can see the
+    judge was skipped.
+
+    Methods accept ``*args, **kwargs`` so they are a drop-in regardless of the
+    exact argument shape individual graders use.
+    """
+
+    # Graders that bypass evaluate() and access ``judge.client`` directly cannot
+    # rely on the evaluate* methods; they can instead guard on
+    # ``getattr(judge, "enabled", True)`` to skip the LLM call when disabled.
+    enabled = False
+
+    def __init__(self) -> None:
+        self._call_log: list[dict] = []
+
+    _REASON = "judge disabled (--no-judge): neutral 0.0 score"
+
+    def _neutral(self, method: str) -> "JudgeResult":
+        self._call_log.append(
+            {"method": method, "no_judge": True, "score": 0.0, "reasoning": self._REASON}
+        )
+        return JudgeResult(score=0.0, reasoning=self._REASON)
+
+    def evaluate(self, *args, **kwargs) -> "JudgeResult":
+        return self._neutral("evaluate")
+
+    def evaluate_actions(self, *args, **kwargs) -> "JudgeResult":
+        return self._neutral("evaluate_actions")
+
+    def evaluate_visual(self, *args, **kwargs) -> "JudgeResult":
+        return self._neutral("evaluate_visual")
 
     def get_call_log(self) -> list[dict]:
         return list(self._call_log)

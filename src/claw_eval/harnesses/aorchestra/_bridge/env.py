@@ -29,7 +29,7 @@ if _AORCHESTRA_ROOT not in sys.path:
 from base.agent.base_action import BaseAction  # noqa: E402
 
 from ....models.task import TaskDefinition
-from ....runner.sandbox_tools import SANDBOX_TOOL_NAMES
+from ....runner.sandbox_tools import SANDBOX_TOOL_NAMES, SANDBOX_TOOLS
 from .actions import (
     SchemaTranslationError,
     make_http_action,
@@ -96,6 +96,109 @@ class ClawEvalEnv:
         """Snapshot copy of accumulated step_log records."""
         return list(self._step_log)
 
+    def tool_schemas(self) -> dict[str, dict[str, Any]]:
+        """Return {name: {description, parameters}} for every task-declared tool.
+
+        Used by the AOrchestra harness to plumb tool schemas through SubAgentSpec
+        to PiRuntime, so Pi-side LLM tool calls see proper parameter schemas
+        instead of a permissive placeholder.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for tool in self._task.tools:
+            out[tool.name] = {
+                "description": tool.description or f"Tool {tool.name}",
+                "parameters": tool.input_schema or {"type": "object", "additionalProperties": True},
+            }
+        return out
+
+    def get_basic_info(self):
+        """Implement AOrchestra Environment ABC.
+
+        Returns BasicInfo so Runner.run() and downstream code can read
+        env metadata uniformly. The action_space text is a brief listing
+        of available tool names — ReActAgent uses this in its prompt
+        (PiRuntime ignores it and uses tool_schemas instead).
+        """
+        # Lazy import so claw-eval modules outside the aorchestra harness
+        # don't pull in AOrchestra. AOrchestra path is injected on sys.path
+        # by the harness; this import lands when the harness is the caller.
+        from benchmark.common.env import BasicInfo
+
+        tool_lines = []
+        for tool in self._task.tools:
+            tool_lines.append(f"- {tool.name}: {tool.description}")
+        action_space_text = "Available tools:\n" + "\n".join(tool_lines) if tool_lines else ""
+
+        return BasicInfo(
+            env_id=self._task.task_id,
+            instruction=self._task.prompt.text,
+            action_space=action_space_text,
+            max_steps=int(getattr(self._task.environment, "max_turns", None) or 30),
+            meta_data={},
+        )
+
+    async def step(self, action):
+        """Implement AOrchestra Environment ABC.
+
+        Dispatch a sub-agent action to the corresponding BaseAction. ``action``
+        is the AOrchestra convention ``{"action": <tool_name>, "params": {...}}``.
+        Returns (observation, reward, done, info).
+
+        - "finish" is the AOrchestra convention for sub-agent termination; it
+          short-circuits to done=True without hitting any BaseAction.
+        - Unknown tool names return done=True with an error info so the
+          sub-agent terminates rather than spinning.
+        - BaseAction returns whatever the upstream tool endpoint sent (dict
+          or string). We pass it through as the observation; reward is 0;
+          done is True only on finish/error (tools don't unilaterally end
+          a sub-agent episode).
+        """
+        name = (action or {}).get("action") or ""
+        params = (action or {}).get("params") or {}
+
+        # AOrchestra-style termination
+        if name == "finish":
+            return (
+                {"finished": True, "finish_result": params},
+                0.0,
+                True,
+                {"finished": True, "finish_result": params},
+            )
+
+        # Look up the BaseAction by name. Use role="sub" since this dispatch
+        # is for SubAgent tool calls; MainAgent dispatch goes through a
+        # different code path (delegate_task, not env.step).
+        actions = self.get_action_space_for("sub")
+        target = next((a for a in actions if getattr(a, "name", None) == name), None)
+        if target is None:
+            return (
+                {"error": f"unknown action: {name}"},
+                0.0,
+                True,
+                {"error": "unknown_action", "requested": name},
+            )
+
+        try:
+            # BaseAction.__call__ is async (per AOrchestra convention) but
+            # some are sync. Handle both shapes.
+            import inspect as _inspect
+
+            result = target(**params)
+            if _inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001
+            return (
+                {"error": f"{type(exc).__name__}: {exc}"},
+                0.0,
+                True,
+                {"error": "action_call_failed", "exception": str(exc)},
+            )
+
+        # Observation is whatever the tool returned. Reward stays 0 (claw-eval
+        # scores at the end, not per-step). Sub-agent tools don't terminate
+        # episodes — only "finish" or an error does.
+        return (result, 0.0, False, {})
+
     @property
     def task_id(self) -> str:
         return self._task.task_id
@@ -125,6 +228,20 @@ class ClawEvalEnv:
                     )
                 actions.append(make_http_action(
                     tool, endpoint, self._step_log,
+                    agent_role=agent_role,
+                ))
+        # Container mode: expose the full SANDBOX_TOOLS set (Bash/Read/Write/
+        # Edit/Glob/Grep/...) so the agent has toolset parity with the
+        # baseline. Only when sandbox_url is set (host mode has none and still
+        # refuses sandbox tools at the gate above). Dedup against task-declared
+        # tool names — mirrors runner/loop.py:261-268.
+        if self._sandbox_url:
+            declared = {tool.name for tool in self._task.tools}
+            for spec in SANDBOX_TOOLS:
+                if spec.name in declared:
+                    continue
+                actions.append(make_sandbox_action(
+                    spec, self._sandbox_url, self._step_log,
                     agent_role=agent_role,
                 ))
         return actions

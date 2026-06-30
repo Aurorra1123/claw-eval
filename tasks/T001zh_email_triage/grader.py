@@ -99,6 +99,12 @@ class EmailTriageGrader(AbstractGrader):
         The judge receives one batched request listing all 8 emails and the full
         response text, and returns a JSON dict mapping msg_id → assigned category.
         """
+        # No judge available (--no-judge / no API key): this LLM-scored
+        # classification dimension cannot be evaluated. Return a neutral 0.0
+        # (the rule-based tool-usage / read-ratio components still contribute).
+        if judge is None or not getattr(judge, "enabled", True):
+            return 0.0
+
         email_list = "\n".join(
             f'{i + 1}. {msg_id}: from {info["sender"]}, subject "{info["subject"]}"'
             for i, (msg_id, info) in enumerate(self.EXPECTED_CLASSIFICATIONS.items())

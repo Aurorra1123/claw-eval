@@ -1,4 +1,4 @@
-"""Wave 3-F §6.8 — placeholder harness contracts.
+"""Wave 3-F §6.8 — placeholder harness contracts + Phase 4 registry expansion.
 
 These tests verify the codex / claudecode stubs:
 
@@ -6,6 +6,9 @@ These tests verify the codex / claudecode stubs:
 * preflight returns a non-empty error list,
 * run() raises ``NotImplementedError``,
 * declare the Protocol surface (name / supported_features / preflight / run).
+
+Plus a Phase 4 Wave 4-D check that the AOrchestra harness is registered as a
+first-class harness (not a placeholder) and preflights a no-tool task cleanly.
 
 Cheap and static — they make sure the slots are reserved correctly so future
 work on Codex / Claude Code starts from a sound base.
@@ -19,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from claw_eval.harnesses import get_harness
+from claw_eval.harnesses.aorchestra import AOrchestraHarness
 from claw_eval.harnesses.base import HarnessResult
 from claw_eval.harnesses.claudecode import ClaudeCodeHarness
 from claw_eval.harnesses.codex import CodexHarness
@@ -96,8 +100,34 @@ def test_placeholder_run_signature_matches_protocol(name: str, cls: type) -> Non
     assert first.name == "task"
 
 
-def test_registry_exposes_all_four_harnesses() -> None:
+def test_registry_exposes_all_five_harnesses() -> None:
     """End-state sanity check: registry surface is what the CLI expects."""
     from claw_eval.harnesses import _REGISTRY
 
-    assert set(_REGISTRY.keys()) == {"claweval", "openclaw", "codex", "claudecode"}
+    assert set(_REGISTRY.keys()) == {
+        "aorchestra", "claweval", "openclaw", "codex", "claudecode",
+    }
+
+
+def test_aorchestra_registered_and_preflights_pure_text_task() -> None:
+    """Phase 4 Wave 4-D: AOrchestra is registered as a first-class harness
+    (not a placeholder) and preflights a no-tool, no-user-agent task cleanly.
+
+    T091 is the canonical pure-text fixture: ``tools: []`` /
+    ``tool_endpoints: []`` / no ``user_agent`` block. The harness should
+    accept it without error.
+    """
+    h = get_harness("aorchestra")
+    assert isinstance(h, AOrchestraHarness)
+    assert h.name == "aorchestra"
+    # AOrchestra is a real implementation, so it MUST advertise both http and
+    # sandbox features.
+    assert "http_services" in h.supported_features
+    assert "sandbox_tools" in h.supported_features
+
+    task = TaskDefinition.from_yaml(
+        Path(__file__).parent.parent
+        / "tasks" / "T091_pinbench_humanize_blog" / "task.yaml"
+    )
+    errs = h.preflight(task)
+    assert errs == [], f"AOrchestra should preflight T091 cleanly: {errs}"

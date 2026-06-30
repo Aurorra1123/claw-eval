@@ -41,3 +41,6 @@ scripts/
 regrade/
 yqb_temp/
 others/
+# Local secrets (API keys) — never commit
+.env
+.env.local

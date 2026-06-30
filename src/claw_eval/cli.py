@@ -63,9 +63,19 @@ def _resolve_task_yaml(task_arg: str) -> Path:
 
 
 def _resolve_tasks_dir(task_yaml: Path) -> Path:
-    """Given a task YAML path like tasks/T01zh_email_triage/task.yaml, return the tasks/ root dir."""
+    """Given a task YAML path like tasks/T01zh_email_triage/task.yaml, return the tasks/ root dir.
+
+    The path is ``.resolve()``-d first so that a *symlinked* task dir resolves to
+    its real location. Without this, a symlink ``tmp/T002 -> repo/tasks/T002``
+    would make ``task_yaml.parent.parent`` = ``tmp`` (the symlink's parent), and
+    callers that use ``tasks_dir.parent`` as the mock-service CWD would land in
+    ``/tmp`` instead of the repo root — breaking the relative
+    ``python mock_services/.../server.py`` service commands. Resolving makes
+    symlinked task dirs behave identically to real ones; for a non-symlink path
+    ``.resolve()`` only absolutises it, leaving ``parent.parent`` unchanged.
+    """
     # task.yaml is at tasks/<ID>/task.yaml — parent.parent is tasks/
-    return task_yaml.parent.parent
+    return task_yaml.resolve().parent.parent
 
 
 def _make_trace_dir(base_dir: str | Path, model_id: str) -> Path:
@@ -126,8 +136,17 @@ def _grade_with_optional_params(
 
     Returns (scores, judge_calls) where judge_calls is a list of dicts
     captured from the LLMJudge call log (empty if judge has no logging).
+
+    When ``judge`` is ``None`` (``--no-judge`` or no judge key), it is replaced
+    with a :class:`NoJudge` null-object so graders that call ``judge.evaluate()``
+    unconditionally contribute a neutral 0.0 sub-score instead of crashing with
+    ``AttributeError: 'NoneType' object has no attribute 'evaluate'``.
     """
     from .graders.base import AbstractGrader
+    from .graders.llm_judge import NoJudge
+
+    if judge is None:
+        judge = NoJudge()
 
     if hasattr(judge, "reset_call_log"):
         judge.reset_call_log()
@@ -433,6 +452,27 @@ def cmd_run(args: argparse.Namespace) -> None:
                 "design doc §3.7 / §7). To run the legacy Wave 3-D host smoke\n"
                 "test, set CLAWEVAL_ALLOW_OPENCLAW_HOST_SMOKE=1 (not for\n"
                 "production evaluation).",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+    # Phase 4 Wave 4-D §4.2: AOrchestra is asymmetric vs OpenClaw — it's OK
+    # in host mode UNLESS the task declares SANDBOX_TOOL_NAMES. AOrchestra is
+    # a Python in-process library; host mode is safe when the agent doesn't
+    # ask for Bash/Read/Write/... tools that would otherwise need a sandbox
+    # server. Refuse the SANDBOX-tools-without-sandbox combo loudly here so
+    # the harness's preflight error has a clearer call site.
+    if args.harness == "aorchestra":
+        from .runner.sandbox_tools import SANDBOX_TOOL_NAMES as _SBX
+
+        task_needs_sandbox = any(t.name in _SBX for t in task.tools)
+        if task_needs_sandbox and not sandbox_mode:
+            sbx_names = [t.name for t in task.tools if t.name in _SBX]
+            print(
+                "ERROR: --harness aorchestra requires --sandbox when the task\n"
+                f"declares sandbox tools {sbx_names}. AOrchestra runs as a Python\n"
+                "library on host; sandbox tools need the in-container sandbox\n"
+                "server (design doc §4.2).",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -958,7 +998,36 @@ def _run_single_task(
     sandbox_runner = None
     if sandbox_mode:
         from .runner.sandbox_runner import SandboxRunner
-        sandbox_runner = SandboxRunner(cfg.sandbox, image=sandbox_image or cfg.sandbox.image)
+        # Mirror cmd_run's openclaw image default (cli.py:437) so batch and
+        # single-task runs behave identically. Without this, --harness openclaw
+        # in batch mode tries to pull "claw-eval-agent:latest" (the generic
+        # default) instead of the locally-built "claw-eval-agent-openclaw:latest".
+        #
+        # Same default for aorchestra: it doesn't ship its own sandbox image,
+        # and the openclaw image's sandbox-server portion is all aorchestra
+        # actually needs from the container (sandbox tools route through it).
+        resolved_image = sandbox_image or cfg.sandbox.image
+        if harness_name in ("openclaw", "aorchestra") and sandbox_image is None:
+            resolved_image = "claw-eval-agent-openclaw:latest"
+        sandbox_runner = SandboxRunner(cfg.sandbox, image=resolved_image)
+
+    # Phase 4 Wave 4-D §4.2 — same asymmetric AOrchestra gate as cmd_run.
+    if harness_name == "aorchestra":
+        from .runner.sandbox_tools import SANDBOX_TOOL_NAMES as _SBX
+
+        task_needs_sandbox = any(t.name in _SBX for t in task.tools)
+        if task_needs_sandbox and not sandbox_mode:
+            sbx_names = [t.name for t in task.tools if t.name in _SBX]
+            return {
+                "task_id": task.task_id,
+                "task_name": task.task_name,
+                "difficulty": task.difficulty,
+                "trials": [],
+                "error": (
+                    f"--harness aorchestra requires --sandbox when task declares "
+                    f"sandbox tools {sbx_names} (design doc §4.2)"
+                ),
+            }
 
     result = {
         "task_id": task.task_id,
@@ -985,7 +1054,31 @@ def _run_single_task(
                         env_snapshot = None
                         if sandbox_runner:
                             run_id = f"{task.task_id}-t{i}-p{port_offset}"
-                            handle = sandbox_runner.start_container(run_id=run_id)
+                            # OpenClaw needs host networking + a volume mount of
+                            # the per-task case_dir + the bridge-log env, exactly
+                            # like cmd_run (cli.py). Without these the bridge
+                            # install (docker exec npm install in a host path not
+                            # mounted in the container) fails with rc=127. Under
+                            # concurrency, host networking makes the sandbox server
+                            # bind a fixed port (8080) that would collide across
+                            # workers, so we give each worker a unique sandbox_port
+                            # derived from its port_offset (mock services are
+                            # already offset by apply_port_offset).
+                            start_kwargs: dict = {"run_id": run_id}
+                            _resolved_trace_dir = trace_dir or cfg.defaults.trace_dir
+                            if harness_name == "openclaw":
+                                _case_dir_mount = (
+                                    Path(_resolved_trace_dir) / f"{task.task_id}_{run_id}_raw"
+                                )
+                                _case_dir_mount.mkdir(parents=True, exist_ok=True)
+                                _bridge_log_in_container = _case_dir_mount / "raw" / "bridge_traffic.jsonl"
+                                start_kwargs["network_mode"] = "host"
+                                start_kwargs["volumes"] = {str(_case_dir_mount): str(_case_dir_mount)}
+                                start_kwargs["extra_env"] = {
+                                    "CLAWEVAL_BRIDGE_LOG": str(_bridge_log_in_container),
+                                }
+                                start_kwargs["sandbox_port"] = 8080 + port_offset
+                            handle = sandbox_runner.start_container(**start_kwargs)
                             try:
                                 n_injected = sandbox_runner.inject_files(handle, task, task_dir=task_dir)
                                 expected_files = len(task.sandbox_files) if task.sandbox_files else len(getattr(task.environment, "fixtures", []))
@@ -1305,31 +1398,102 @@ def cmd_batch(args: argparse.Namespace) -> None:
         str(d) for d in tasks_dir.iterdir()
         if d.is_dir() and (d / "task.yaml").exists()
     )
-    if args.filter:
-        filt = args.filter.lower()
-        task_dirs = [d for d in task_dirs if filt in d.lower()]
 
-    if args.tag:
-        from .models.task import TaskDefinition as _TD
-        filtered = []
-        for d in task_dirs:
-            td = _TD.from_yaml(Path(d) / "task.yaml")
-            if args.tag in td.tags:
-                filtered.append(d)
-        task_dirs = filtered
-
-    if getattr(args, "range", None):
-        import re as _re
-        _m = _re.match(r"(\d+)-(\d+)$", args.range)
-        if not _m:
-            print(f"[ERROR] Invalid --range format: {args.range}  (expected L-R, e.g. 1-104)")
+    # --task-ids: authoritative selection of an arbitrary, possibly
+    # non-contiguous set of tasks (e.g. T002,T008,T012,T018,T077). It is
+    # mutually exclusive with the other selectors — combining them is almost
+    # always a mistake, so we error loudly rather than silently picking a winner.
+    task_ids_arg = getattr(args, "task_ids", None)
+    if task_ids_arg:
+        conflicting = [
+            name for name, val in (
+                ("--filter", args.filter),
+                ("--tag", args.tag),
+                ("--range", getattr(args, "range", None)),
+            )
+            if val
+        ]
+        if conflicting:
+            print(
+                f"[ERROR] --task-ids is mutually exclusive with "
+                f"{', '.join(conflicting)} — pass only one selection method."
+            )
             sys.exit(1)
-        lo, hi = int(_m.group(1)), int(_m.group(2))
-        def _in_range(d):
+
+        import re as _re
+
+        requested = [tok.strip() for tok in task_ids_arg.split(",") if tok.strip()]
+        if not requested:
+            print("[ERROR] --task-ids was given but contained no task IDs.")
+            sys.exit(1)
+
+        # Build a lookup from both the full dir name (== task_id) and the bare
+        # numeric ID prefix (T002) to the task dir path(s).
+        by_name: dict[str, str] = {}
+        by_numeric: dict[str, list[str]] = {}
+        for d in task_dirs:
             name = Path(d).name
-            m = _re.match(r"T(\d+)", name)
-            return m is not None and lo <= int(m.group(1)) <= hi
-        task_dirs = [d for d in task_dirs if _in_range(d)]
+            by_name[name] = d
+            nm = _re.match(r"(T\d+)", name)
+            if nm:
+                by_numeric.setdefault(nm.group(1), []).append(d)
+
+        selected: list[str] = []
+        not_found: list[str] = []
+        seen: set[str] = set()
+        for tok in requested:
+            match = None
+            if tok in by_name:
+                match = by_name[tok]
+            elif tok in by_numeric:
+                cands = by_numeric[tok]
+                if len(cands) > 1:
+                    print(
+                        f"[ERROR] --task-ids token {tok!r} is ambiguous — matches "
+                        f"{[Path(c).name for c in cands]}. Use the full task-dir name."
+                    )
+                    sys.exit(1)
+                match = cands[0]
+            if match is None:
+                not_found.append(tok)
+            elif match not in seen:
+                seen.add(match)
+                selected.append(match)
+
+        if not_found:
+            print(
+                f"[ERROR] --task-ids: {len(not_found)} requested ID(s) not found "
+                f"in {tasks_dir}: {', '.join(not_found)}"
+            )
+            sys.exit(1)
+
+        task_dirs = selected
+    else:
+        if args.filter:
+            filt = args.filter.lower()
+            task_dirs = [d for d in task_dirs if filt in d.lower()]
+
+        if args.tag:
+            from .models.task import TaskDefinition as _TD
+            filtered = []
+            for d in task_dirs:
+                td = _TD.from_yaml(Path(d) / "task.yaml")
+                if args.tag in td.tags:
+                    filtered.append(d)
+            task_dirs = filtered
+
+        if getattr(args, "range", None):
+            import re as _re
+            _m = _re.match(r"(\d+)-(\d+)$", args.range)
+            if not _m:
+                print(f"[ERROR] Invalid --range format: {args.range}  (expected L-R, e.g. 1-104)")
+                sys.exit(1)
+            lo, hi = int(_m.group(1)), int(_m.group(2))
+            def _in_range(d):
+                name = Path(d).name
+                m = _re.match(r"T(\d+)", name)
+                return m is not None and lo <= int(m.group(1)) <= hi
+            task_dirs = [d for d in task_dirs if _in_range(d)]
 
     # If rerunning errors, only keep the errored task dirs
     if errored_task_ids:
@@ -1732,7 +1896,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
     p_run.add_argument("--proxy", default=None, help="HTTP proxy URL for model/judge API traffic (e.g. http://proxy:port)")
     p_run.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
 
@@ -1749,7 +1913,7 @@ def main(argv: list[str] | None = None) -> None:
     p_inner.add_argument("--no-judge", action="store_true")
     p_inner.add_argument("--proxy", default=None)
     p_inner.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
 
@@ -1775,6 +1939,13 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--filter", default=None, help="Only run tasks matching this substring (e.g. 'en_' or 'T01')")
     p_batch.add_argument("--tag", default=None, help="Only run tasks with this tag (e.g. 'multimodal', 'general')")
     p_batch.add_argument("--range", default=None, help="Only run tasks in numeric ID range (e.g. '1-104')")
+    p_batch.add_argument(
+        "--task-ids", default=None, dest="task_ids", metavar="ID1,ID2,...",
+        help="Run an explicit comma-separated set of tasks, e.g. "
+             "'T002_email_triage,T008_todo_management' or short form 'T002,T008'. "
+             "Authoritative selection — mutually exclusive with --filter/--tag/--range. "
+             "Errors if any requested ID does not exist.",
+    )
     p_batch.add_argument("--parallel", type=int, default=4, help="Number of parallel workers (default: 4)")
     p_batch.add_argument("--model", default=None)
     p_batch.add_argument("--api-key", default=None)
@@ -1790,7 +1961,7 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--sandbox-image", default=None, help="Override sandbox Docker image name")
     p_batch.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
     p_batch.add_argument(
-        "--harness", default="claweval", choices=["claweval", "openclaw", "codex", "claudecode"],
+        "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
         help="Agent harness driving the rollout (default: claweval)",
     )
     p_batch.add_argument("--rerun-errors", default=None, metavar="TRACE_DIR",
