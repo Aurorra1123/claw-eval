@@ -261,6 +261,34 @@ def test_media_tools_render_as_factory_with_image_blocks() -> None:
         assert "recordCall(" in src
 
 
+def test_readmedia_injects_native_frame_budget() -> None:
+    # Regression for the openclaw-arm vision gap: the bridge must request the
+    # same compressed-frame contract the native SandboxToolDispatcher applies
+    # (<=1280px / JPEG q60 / <=64 frames). Without it, full-resolution PNG
+    # frames blow OpenClaw's per-tool-result payload cap and the whole image
+    # batch is dropped — the model goes blind and hallucinates.
+    src = _render("ReadMedia")
+    assert 'const _req = { ...(params ?? {}) }' in src
+    assert '_req.frame_format = "jpeg"' in src
+    assert "_req.frame_quality = 60" in src
+    assert "_req.frame_budget = 8" in src
+    assert '_req.screen_size = "1280x1280"' in src
+    # explicit agent-provided values win (only defaulted when null).
+    assert "if (_req.screen_size == null)" in src
+    # the fetch body uses the augmented request, not raw params.
+    assert "JSON.stringify(_req)" in src
+
+
+def test_non_readmedia_media_tools_do_not_inject_frame_budget() -> None:
+    # BrowserScreenshot (/screenshot) and Read (/read) have their own request
+    # models that reject these fields — only ReadMedia (/read_media) accepts
+    # them, so the injection must be gated to ReadMedia alone.
+    for name in ("BrowserScreenshot", "Read"):
+        src = _render(name)
+        assert "_req.frame_format" not in src, f"{name} must not inject frame budget"
+        assert "JSON.stringify(params ?? {})" in src, f"{name} keeps raw params body"
+
+
 def test_non_media_tool_keeps_plain_execute_form() -> None:
     src = _render("web_search")
     assert "factory:" not in src

@@ -480,7 +480,33 @@ def _render_media_tool(
     ``wrapToolPluginResult``), so we can emit one ``{type:"image"}`` content
     block per frame — exactly how the native ``SandboxDispatcher`` feeds frames
     to the loop. Base64 is stripped from the text summary to save tokens.
+
+    Frame budget (ReadMedia only): we inject a compressed-frame contract
+    (<=1280px, JPEG q60, <=8 frames) into the request. OpenClaw's
+    openai-completions provider only forwards image parts from the *latest*
+    user message and caps them at ``maxImageParts`` (DEFAULT_OPENAI_MAX_IMAGE_PARTS
+    = 8); above that the whole image batch is dropped and the model goes blind.
+    Capping to 8 uniformly-sampled, downscaled frames keeps every ReadMedia
+    result deliverable. BrowserScreenshot / Read keep their own request bodies
+    (their endpoints don't accept these fields).
     """
+    if tool_name == "ReadMedia":
+        req_prep = (
+            "\n          // Mirror OpenClaw's openai-completions image contract: the"
+            "\n          // provider forwards only the latest user message's image parts"
+            "\n          // and caps them at maxImageParts (default 8) — more are dropped"
+            "\n          // whole, blinding the model. Request downscaled JPEG + a <=8"
+            "\n          // frame budget so each ReadMedia result stays deliverable."
+            "\n          const _req = { ...(params ?? {}) };"
+            "\n          if (_req.screen_size == null) _req.screen_size = \"1280x1280\";"
+            "\n          if (_req.frame_format == null) _req.frame_format = \"jpeg\";"
+            "\n          if (_req.frame_quality == null) _req.frame_quality = 60;"
+            "\n          if (_req.frame_budget == null) _req.frame_budget = 8;"
+        )
+        req_body = "_req"
+    else:
+        req_prep = ""
+        req_body = "params ?? {}"
     return f"""    tool({{
       name: {_js_string(tool_name)},
       description: {_js_string(description)},
@@ -496,12 +522,12 @@ def _render_media_tool(
           const started = Date.now();
           let status = -1;
           let body: any = null;
-          let errMsg: string | undefined;
+          let errMsg: string | undefined;{req_prep}
           try {{
             const resp = await fetch(url, {{
               method,
               headers: {{ "content-type": "application/json" }},
-              body: JSON.stringify(params ?? {{}}),
+              body: JSON.stringify({req_body}),
             }});
             status = resp.status;
             const text = await resp.text();

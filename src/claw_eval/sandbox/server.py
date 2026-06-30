@@ -74,6 +74,14 @@ class ReadMediaRequest(BaseModel):
     start_time: float = 0.0
     end_time: float | None = None
     screen_size: str | None = None  # e.g. "1280x720" resize output
+    # Frame encoding (opt-in). Default keeps full-resolution PNG so the native
+    # SandboxToolDispatcher — which does its own Python-side resize+JPEG — is
+    # unaffected. The OpenClaw bridge sets these to mirror native's frame budget
+    # (1280px / JPEG q60 / <=64 frames) so payloads stay under OpenClaw's
+    # per-tool-result cap instead of being dropped whole.
+    frame_format: str = "png"        # "png" | "jpeg"
+    frame_quality: int = 60          # JPEG quality when frame_format="jpeg"
+    frame_budget: int | None = None  # uniformly subsample to at most N frames
     # PDF options
     pdf_pages: str = "all"  # "all", "1-3", "1,3,5"
     dpi: int = 100
@@ -410,6 +418,27 @@ def _image_to_b64_png(img) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _image_to_b64_jpeg(img, quality: int = 60) -> str:
+    """Convert PIL Image to base64-encoded JPEG.
+
+    Mirrors the native ``_compress_image_b64`` RGB handling (composite
+    RGBA/LA/transparent-palette onto a white background) so bridge frames are
+    byte-comparable to the native dispatcher's output.
+    """
+    import io
+    from PIL import Image as _PILImage
+    if img.mode not in ("RGB", "L"):
+        background = _PILImage.new("RGB", img.size, (255, 255, 255))
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            background.paste(img, mask=img.convert("RGBA").split()[-1])
+        else:
+            background.paste(img.convert("RGB"))
+        img = background
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def _parse_screen_size(s: str | None) -> int | None:
     """Parse '1280x720' -> max dimension (1280)."""
     if not s:
@@ -520,19 +549,32 @@ def _read_video(p: Path, req: ReadMediaRequest) -> dict:
 
         # Read extracted frames
         frames = []
-        frame_files = sorted(Path(tmpdir).glob("frame_*.jpg"))
-        for idx, ff in enumerate(frame_files[:req.max_frames]):
-            img = Image.open(ff)
+        frame_files = sorted(Path(tmpdir).glob("frame_*.jpg"))[:req.max_frames]
+        # Uniformly subsample to the requested budget (mirrors native dispatcher's
+        # max_images_per_turn). Keeps original positions for accurate timestamps.
+        total = len(frame_files)
+        if req.frame_budget and total > req.frame_budget:
+            sel = [int(i * total / req.frame_budget) for i in range(req.frame_budget)]
+        else:
+            sel = list(range(total))
+        use_jpeg = req.frame_format.lower() == "jpeg"
+        for idx in sel:
+            img = Image.open(frame_files[idx])
             if max_dim:
                 img = _resize_image(img, max_dim)
-            b64 = _image_to_b64_png(img)
-            # Calculate timestamp
+            if use_jpeg:
+                b64 = _image_to_b64_jpeg(img, req.frame_quality)
+                mime = "image/jpeg"
+            else:
+                b64 = _image_to_b64_png(img)
+                mime = "image/png"
+            # Calculate timestamp from the frame's original position
             timestamp = start + idx / max(req.fps, 0.001)
             frames.append({
                 "index": idx,
                 "timestamp_s": round(timestamp, 2),
                 "image_b64": b64,
-                "mime_type": "image/png",
+                "mime_type": mime,
             })
 
     dur_str = f"{duration:.1f}s" if duration else "unknown"
