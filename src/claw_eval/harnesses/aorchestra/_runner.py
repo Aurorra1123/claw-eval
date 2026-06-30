@@ -58,10 +58,221 @@ from aorchestra.tools.delegate import DelegateTaskTool  # noqa: E402
 if TYPE_CHECKING:
     from ...config import Config
     from ...models.task import TaskDefinition
+    from ...runner.user_agent import UserAgent
     from ._bridge.env import ClawEvalEnv
 
 
 _log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn simulated user (user_agent): rebuild the conversation a UserAgent
+# needs to see, from the attempts_detail accumulated so far.
+# ---------------------------------------------------------------------------
+
+
+def _build_conversation_for_ua(
+    attempts_detail: List[Dict[str, Any]],
+    task: "TaskDefinition",
+) -> List[Any]:
+    """Reconstruct a ``list[Message]`` for ``UserAgent.generate_response``.
+
+    The native loop hands the UserAgent the full running ``messages`` list; here
+    we synthesise an equivalent transcript from ``attempts_detail`` so the
+    simulated user can react to what the agent actually said. The UserAgent only
+    consumes ``Message.text`` via ``_format_transcript`` (user_agent.py:29-44),
+    so we only need role + text fidelity, in time order:
+
+    * the task prompt becomes the opening ``user`` message;
+    * each ``complete`` action becomes an ``assistant`` message (its answer);
+    * each prior ``user_agent_reply`` becomes a ``[user_agent]``-prefixed
+      ``user`` message (``_format_transcript`` strips that prefix).
+
+    Tool calls / delegations are omitted — they carry no user-facing text the
+    simulated user needs to clarify against, and including their raw JSON would
+    only confuse the persona model.
+    """
+    from ...models.content import TextBlock
+    from ...models.message import Message
+
+    conv: List[Any] = [
+        Message(role="user", content=[TextBlock(text=task.prompt.text)])
+    ]
+    for a in attempts_detail:
+        action = a.get("action")
+        if action == "complete":
+            params = a.get("params") or {}
+            ans = params.get("answer") if isinstance(params, dict) else None
+            text = "" if ans is None else str(ans)
+            if text:
+                conv.append(
+                    Message(role="assistant", content=[TextBlock(text=text)])
+                )
+        elif action == "user_agent_reply":
+            res = a.get("result") or {}
+            reply = res.get("reply") if isinstance(res, dict) else None
+            if reply:
+                conv.append(
+                    Message(
+                        role="user",
+                        content=[TextBlock(text=f"[user_agent]\n{reply}")],
+                    )
+                )
+    return conv
+
+
+# ---------------------------------------------------------------------------
+# Multimodal: load image attachments and build image_url content blocks
+# ---------------------------------------------------------------------------
+
+
+def _load_task_images(
+    task: "TaskDefinition",
+    cfg: "Config",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load image attachments for the MainAgent's first LLM turn.
+
+    Reuses the native ``media_loader`` (no bespoke image handling) so the AO
+    arm stays byte-for-byte aligned with the native loop's media path:
+    ``collect_media_references`` + ``load_media_from_ref`` honour the same
+    ``cfg.media`` knobs (enabled / max_files / max_bytes_per_file /
+    image_max_dimension) and the same data-URI shape used by
+    ``providers/openai_compat.py``.
+
+    Returns ``(image_blocks, media_records)`` where:
+
+    * ``image_blocks`` are OpenAI-compatible
+      ``{"type": "image_url", "image_url": {"url": "data:<mime>;base64,<b64>"}}``
+      dicts to hand to AOrchestra's LLM client (async_llm accepts a content list).
+    * ``media_records`` mirror the native ``MediaLoad`` event fields so the
+      trace adapter can emit a ``MediaLoad(modality=image, status=...)`` event
+      per attachment — the multimodal grader's ``image_loaded`` dimension reads
+      these (image_qa_oracle.py:38-42).
+
+    Non-multimodal tasks (no attachments / no in-text refs) return ``([], [])``
+    and the caller takes the plain-text path — zero behaviour change.
+    """
+    # Lazy import: media_loader pulls Pillow-adjacent deps only when needed.
+    from ...runner.media_loader import (
+        collect_media_references,
+        load_media_from_ref,
+        model_supports_modality,
+    )
+
+    media_cfg = cfg.media
+    model_cfg = cfg.model
+
+    image_blocks: List[Dict[str, Any]] = []
+    media_records: List[Dict[str, Any]] = []
+
+    if media_cfg is not None and not media_cfg.enabled:
+        return image_blocks, media_records
+
+    refs = collect_media_references(task.prompt.text, task.prompt.attachments)
+    if not refs:
+        return image_blocks, media_records
+
+    workspace_root = Path.cwd()
+    task_dir = Path(task.task_file).parent if task.task_file else None
+
+    for idx, ref in enumerate(refs):
+        # Best-effort modality for skipped/error records (matches native loop).
+        ref_modality = "image"
+        if ref.mime_type:
+            if ref.mime_type.startswith("audio/"):
+                ref_modality = "audio"
+            elif ref.mime_type.startswith("video/"):
+                ref_modality = "video"
+            elif ref.mime_type.startswith("text/") or ref.mime_type in {
+                "application/json",
+                "application/xml",
+            }:
+                ref_modality = "document"
+
+        if idx >= media_cfg.max_files:
+            media_records.append({
+                "modality": ref_modality,
+                "source_path": ref.raw_path,
+                "mime_type": ref.mime_type or "",
+                "size_bytes": 0,
+                "sha256": "",
+                "status": "skipped",
+                "note": f"exceeds max_files={media_cfg.max_files}",
+            })
+            continue
+
+        try:
+            loaded = load_media_from_ref(
+                ref,
+                workspace_root=workspace_root,
+                task_dir=task_dir,
+                max_bytes=media_cfg.max_bytes_per_file,
+                image_max_dimension=media_cfg.image_max_dimension,
+            )
+        except Exception as exc:  # noqa: BLE001 — match native loop tolerance
+            media_records.append({
+                "modality": ref_modality,
+                "source_path": ref.raw_path,
+                "mime_type": ref.mime_type or "",
+                "size_bytes": 0,
+                "sha256": "",
+                "status": "error",
+                "note": str(exc),
+            })
+            if media_cfg.strict_mode:
+                raise
+            continue
+
+        # Only image modality is injected into the AO MainAgent (audio/video/
+        # document are out of scope for this arm). Non-image modalities are
+        # recorded as skipped so the trace stays honest.
+        if loaded.modality != "image":
+            media_records.append({
+                "modality": loaded.modality,
+                "source_path": loaded.source_path,
+                "mime_type": loaded.mime_type,
+                "size_bytes": loaded.size_bytes,
+                "sha256": loaded.sha256,
+                "status": "skipped",
+                "note": f"aorchestra arm injects image only, not {loaded.modality}",
+            })
+            continue
+
+        if not model_supports_modality(model_cfg.input_modalities, loaded.modality):
+            media_records.append({
+                "modality": loaded.modality,
+                "source_path": loaded.source_path,
+                "mime_type": loaded.mime_type,
+                "size_bytes": loaded.size_bytes,
+                "sha256": loaded.sha256,
+                "status": "skipped",
+                "note": f"model does not support modality: {loaded.modality}",
+            })
+            if media_cfg.strict_mode:
+                raise ValueError(
+                    f"Model {model_cfg.model_id} does not support {loaded.modality} input"
+                )
+            continue
+
+        # data-URI shape matches providers/openai_compat.py:151 and the format
+        # AOrchestra's async_llm consumes (async_llm.py:430-438).
+        data_uri = f"data:{loaded.mime_type};base64,{loaded.data_base64}"
+        image_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": data_uri},
+        })
+        media_records.append({
+            "modality": loaded.modality,
+            "source_path": loaded.source_path,
+            "mime_type": loaded.mime_type,
+            "size_bytes": loaded.size_bytes,
+            "sha256": loaded.sha256,
+            "status": "loaded",
+            "note": ref.source,
+        })
+
+    return image_blocks, media_records
+
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +508,7 @@ def _save_trajectory(
     final_answer: str | None,
     error: str | None,
     max_attempts: int,
+    media_records: List[Dict[str, Any]] | None = None,
 ) -> Path:
     case_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{task.task_id}_{timestamp}.json"
@@ -325,6 +537,9 @@ def _save_trajectory(
         "final_answer": final_answer,
         "instruction": task.prompt.text,
         "meta": {},
+        # Multimodal: per-attachment load outcomes (loaded/skipped/error) so the
+        # trace adapter can emit MediaLoad events the image grader reads.
+        "media": media_records or [],
     }
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
@@ -342,11 +557,22 @@ async def run_one_task(
     *,
     case_dir: Path,
     sandbox_url: str | None = None,
+    user_agent: "UserAgent | None" = None,
 ) -> Dict[str, Any]:
     """Run a single claw-eval task through AOrchestra's MainAgent.
 
     Returns ``{"trajectory_path": Path, "status": "ok"|"error"|"timeout",
     "duration_ms": int}``.
+
+    ``user_agent`` — when non-None (the CLI builds it from
+    ``_make_user_agent`` for tasks with ``user_agent.enabled``), the
+    orchestration loop runs multi-turn simulated-user rounds: each ``complete``
+    action becomes a user turn (the answer is handed to
+    ``UserAgent.generate_response``); a non-``None`` reply is injected back into
+    ``MainAgent.context`` (no reset) and the loop continues on the next attempt.
+    ``task.user_agent.max_rounds`` bounds the number of such rounds. When None
+    (the common case), the loop behaves exactly as before — the first
+    ``complete`` ends the task (single-shot, zero behaviour change).
 
     On exception the function does NOT re-raise — it persists whatever
     trajectory we have so far (possibly empty) and returns ``status="error"``.
@@ -366,6 +592,14 @@ async def run_one_task(
     # that don't set it.
     max_attempts = int(getattr(task.environment, "max_turns", 0) or 10)
     timeout_s = float(getattr(task.environment, "timeout_seconds", 0) or 300)
+
+    # Multi-turn simulated user (user_agent). When the CLI supplied a live
+    # UserAgent, each ``complete`` action is treated as a user-turn boundary
+    # (see ``_loop`` below). ``persona`` / ``max_rounds`` come from the task; a
+    # missing ``task.user_agent`` (older task schema) disables the feature.
+    ua_cfg = getattr(task, "user_agent", None)
+    ua_persona = getattr(ua_cfg, "persona", "") if ua_cfg is not None else ""
+    ua_max_rounds = int(getattr(ua_cfg, "max_rounds", 0) or 0) if ua_cfg is not None else 0
 
     # Attach the task instruction onto the env so DelegateTaskTool /
     # _SubAgentEnv can read it (delegate.py:132 reads ``env.instruction``).
@@ -414,6 +648,7 @@ async def run_one_task(
     ]
 
     attempts_detail: List[Dict[str, Any]] = []
+    media_records: List[Dict[str, Any]] = []
     final_answer: str | None = None
     error_msg: str | None = None
     status: Literal["ok", "error", "timeout"] = "ok"
@@ -451,6 +686,17 @@ async def run_one_task(
         )
         main_agent.reset(main_info)
 
+        # Multimodal: load image attachments (if any) and hand them to the
+        # MainAgent so they're prepended to the FIRST LLM turn. Empty for
+        # non-multimodal tasks → MainAgent takes the plain-text path unchanged.
+        image_blocks, media_records = _load_task_images(task, cfg)
+        if image_blocks:
+            main_agent.image_contents = image_blocks
+            _log.info(
+                "[aorchestra] injected %d image(s) into MainAgent for task %s",
+                len(image_blocks), task.task_id,
+            )
+
         try:
             main_cost_before = main_agent.get_usage_cost()
         except Exception:  # noqa: BLE001 — defensive
@@ -458,6 +704,7 @@ async def run_one_task(
 
         async def _loop() -> None:
             nonlocal final_answer, success
+            ua_rounds = 0
             for attempt_idx in range(max_attempts):
                 action_result, raw_response = await main_agent.step(None, [])
                 action_name = action_result.get("action")
@@ -474,6 +721,42 @@ async def run_one_task(
 
                 if action_name == "complete":
                     ans = params.get("answer") if isinstance(params, dict) else None
+
+                    # Multi-turn user_agent: treat this ``complete`` answer as a
+                    # reply to the simulated user and ask it for a follow-up.
+                    if user_agent is not None and ua_rounds < ua_max_rounds:
+                        conv = _build_conversation_for_ua(attempts_detail, task)
+                        ua_text = user_agent.generate_response(
+                            persona=ua_persona,
+                            conversation_messages=conv,
+                        )
+                        if ua_text is None:
+                            # [DONE]: the user is satisfied — terminal answer is
+                            # the last ``complete`` answer (same as single-shot).
+                            if ans is not None:
+                                final_answer = str(ans)
+                            success = True
+                            break
+                        ua_rounds += 1
+                        # Record the simulated user's reply as its own trajectory
+                        # entry so the trace adapter can emit a ``[user_agent]``-
+                        # prefixed user message (the user_agent_clarify grader
+                        # splits clarify/answer phases on that marker).
+                        attempts_detail.append({
+                            "attempt": attempt_idx + 1,
+                            "action": "user_agent_reply",
+                            "params": {},
+                            "result": {"reply": ua_text},
+                            "raw_response": "",
+                        })
+                        # Inject the reply into the MainAgent's running context
+                        # (NO reset — the agent keeps its accumulated state and
+                        # picks up the clarification on the next attempt).
+                        main_agent.context += f"\n\n[user_agent]\n{ua_text}"
+                        continue
+
+                    # No user_agent, or rounds exhausted → original terminal
+                    # behaviour (first/last ``complete`` ends the task).
                     if ans is not None:
                         final_answer = str(ans)
                     success = True
@@ -541,6 +824,7 @@ async def run_one_task(
         final_answer=final_answer,
         error=error_msg,
         max_attempts=max_attempts,
+        media_records=media_records,
     )
 
     return {

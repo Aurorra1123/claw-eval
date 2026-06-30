@@ -100,10 +100,19 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from ...models.content import TextBlock, ToolResultBlock, ToolUseBlock
+from ...config import MediaConfig
+from ...models.content import (
+    AudioBlock,
+    ImageBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    VideoBlock,
+)
 from ...models.message import Message
 from ...models.trace import (
     AuditSnapshot,
+    MediaLoad,
     TokenUsage,
     ToolDispatch,
     TraceEnd,
@@ -259,6 +268,174 @@ def _ensure_input_dict(params: Any) -> dict[str, Any]:
     return {}
 
 
+_VALID_MODALITIES: frozenset[str] = frozenset({"image", "audio", "video", "document"})
+_VALID_MEDIA_STATUSES: frozenset[str] = frozenset({"loaded", "skipped", "error"})
+
+
+def _raw_load_for_media(path: Path | None) -> dict[str, Any] | None:
+    """Tolerant trajectory read used only to recover the ``media`` list.
+
+    ``_safe_load_json`` degrades a trajectory with an empty ``trajectory`` list
+    to ``None`` (no agent steps). But images may have loaded before the agent
+    errored, so the ``media`` records still matter for grading. This parse skips
+    the empty-``trajectory`` gate and returns the dict (or ``None``).
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return None
+    try:
+        raw = p.read_text().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _build_media_events(
+    trajectory_data: dict[str, Any] | None,
+    *,
+    trace_id: str,
+) -> list[MediaLoad]:
+    """Translate the trajectory's ``media`` records into MediaLoad events.
+
+    The AO runner (``_runner.py::_load_task_images``) records one dict per
+    attachment with the same fields the native loop's MediaLoad carries
+    (modality / source_path / mime_type / size_bytes / sha256 / status / note).
+    The multimodal grader's ``image_loaded`` dimension keys off a
+    ``MediaLoad(modality="image", status="loaded")`` event in the trace, so we
+    surface them here. Malformed / out-of-range records are skipped defensively.
+    """
+    if not isinstance(trajectory_data, dict):
+        return []
+    raw = trajectory_data.get("media")
+    if not isinstance(raw, list):
+        return []
+    events: list[MediaLoad] = []
+    for rec in raw:
+        if not isinstance(rec, dict):
+            continue
+        modality = rec.get("modality")
+        if modality not in _VALID_MODALITIES:
+            continue
+        status = rec.get("status", "loaded")
+        if status not in _VALID_MEDIA_STATUSES:
+            status = "loaded"
+        try:
+            size_bytes = int(rec.get("size_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        events.append(
+            MediaLoad(
+                trace_id=trace_id,
+                modality=modality,  # type: ignore[arg-type]
+                source_path=str(rec.get("source_path") or ""),
+                mime_type=str(rec.get("mime_type") or ""),
+                size_bytes=size_bytes,
+                sha256=str(rec.get("sha256") or ""),
+                status=status,  # type: ignore[arg-type]
+                note=str(rec.get("note") or ""),
+            )
+        )
+    return events
+
+
+def _build_initial_media_blocks(
+    trajectory_data: dict[str, Any] | None,
+) -> list[ImageBlock | AudioBlock | VideoBlock | TextBlock]:
+    """Rebuild the opening user message's media content blocks.
+
+    The native loop's initial user message is ``[TextBlock, ImageBlock, ...]``
+    (``loop.py::_build_initial_user_content``): for every attachment the model
+    supports, it appends ``to_content_block(load_media_from_ref(...))``. The AO
+    trajectory only persists ``media`` *metadata* (source_path / mime_type /
+    status / ...) — never the base64 payload — so to mirror native we reload
+    each ``status=="loaded"`` record from its ``source_path`` and re-encode it
+    via the same ``media_loader`` helpers native uses.
+
+    Only ``loaded`` records produce a block; ``skipped`` / ``error`` records do
+    not (native only appends a block when the load succeeds AND the model
+    supports the modality). Each re-load is independently tolerant: if the file
+    has since been deleted / moved / become unreadable we skip that block and
+    leave the message as plain text rather than aborting the whole rebuild.
+    """
+    # Local imports keep the module's top-level import surface unchanged for
+    # non-multimodal tasks and avoid a hard dependency cycle through runner.
+    from ...runner.media_loader import (
+        MediaRef,
+        load_media_from_ref,
+        to_content_block,
+    )
+
+    if not isinstance(trajectory_data, dict):
+        return []
+    raw = trajectory_data.get("media")
+    if not isinstance(raw, list):
+        return []
+
+    cfg = MediaConfig()
+    blocks: list[ImageBlock | AudioBlock | VideoBlock | TextBlock] = []
+    for rec in raw:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("modality") != "image":
+            # Mirror fix scope: only image blocks are rebuilt into the opening
+            # message (matches the T057-style multimodal alignment target).
+            continue
+        if rec.get("status") != "loaded":
+            continue
+        source_path = rec.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            continue
+        mime_type = rec.get("mime_type")
+        ref = MediaRef(
+            raw_path=source_path,
+            source="aorchestra_trajectory_media",
+            mime_type=mime_type if isinstance(mime_type, str) and mime_type else None,
+        )
+        try:
+            loaded = load_media_from_ref(
+                ref,
+                workspace_root=Path.cwd(),
+                task_dir=None,
+                max_bytes=cfg.max_bytes_per_file,
+                image_max_dimension=cfg.image_max_dimension,
+            )
+            blocks.append(to_content_block(loaded))
+        except Exception as exc:  # noqa: BLE001 — tolerate any reload failure
+            _log.warning(
+                "could not rebuild initial image block from %s: %s",
+                source_path, exc,
+            )
+            continue
+    return blocks
+
+
+def _count_user_agent_rounds(trajectory_data: dict[str, Any] | None) -> int:
+    """Number of ``user_agent_reply`` entries in the trajectory.
+
+    The AO runner appends one such entry per simulated-user follow-up
+    (``_runner.py``: ``"action": "user_agent_reply"``), so this matches the
+    native loop's ``user_agent_rounds`` counter one-for-one.
+    """
+    if not isinstance(trajectory_data, dict):
+        return 0
+    traj = trajectory_data.get("trajectory")
+    if not isinstance(traj, list):
+        return 0
+    return sum(
+        1
+        for s in traj
+        if isinstance(s, dict) and s.get("action") == "user_agent_reply"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Trajectory walk
 # ---------------------------------------------------------------------------
@@ -285,6 +462,32 @@ def _emit_step(
     raw_response = step.get("raw_response")
     if not isinstance(raw_response, str):
         raw_response = ""
+
+    # --- user_agent_reply: simulated user's follow-up turn ---
+    # Emitted right after the assistant's ``complete`` for the same attempt, so
+    # the conversation reads agent-answer → user-clarification in order. The
+    # ``[user_agent]`` prefix is a HARD dependency of the user_agent_clarify
+    # grader, which splits the trace into clarify/answer phases on the last
+    # user message starting with that marker (user_agent_clarify_base.py).
+    if action == "user_agent_reply":
+        reply = ""
+        if isinstance(result, dict):
+            r = result.get("reply")
+            if isinstance(r, str):
+                reply = r
+            elif r is not None:
+                reply = _stringify(r)
+        messages.append(
+            TraceMessage(
+                trace_id=trace_id,
+                message=Message(
+                    role="user",
+                    content=[TextBlock(text=f"[user_agent]\n{reply}")],
+                ),
+                agent_role=agent_role,
+            )
+        )
+        return
 
     # --- delegate_task: recurse into the sub-agent's trace ---
     if action == "delegate_task":
@@ -414,6 +617,17 @@ def translate_aorchestra(
     step_log_records = _load_step_log(step_log_path)
     step_log_index = _index_step_log(step_log_records)
 
+    # Media records live in the trajectory JSON but must survive the
+    # empty-``trajectory`` gate in ``_safe_load_json`` (images can be loaded
+    # even if the agent then errored before emitting a step). Read them from a
+    # tolerant raw parse so a multimodal MediaLoad event still reaches the
+    # grader's ``image_loaded`` dimension.
+    media_events = _build_media_events(
+        trajectory_data if trajectory_data is not None
+        else _raw_load_for_media(trajectory_path),
+        trace_id=trace_id,
+    )
+
     # Pull the model id from trajectory metadata; fall back to "" on partial.
     model = ""
     if trajectory_data is not None:
@@ -438,13 +652,23 @@ def translate_aorchestra(
     # ----- build message list -----
     messages: list[TraceMessage] = []
 
-    # Open: user prompt
+    # Open: user prompt. When the task loaded images, mirror the native loop's
+    # initial user message shape (``[TextBlock, ImageBlock, ...]``) by reloading
+    # the loaded media from disk and appending the rebuilt blocks. Non-multimodal
+    # tasks (no loaded media) keep a pure-text opening message.
+    opening_content: list = [TextBlock(text=task.prompt.text)]
+    opening_content.extend(
+        _build_initial_media_blocks(
+            trajectory_data if trajectory_data is not None
+            else _raw_load_for_media(trajectory_path)
+        )
+    )
     messages.append(
         TraceMessage(
             trace_id=trace_id,
             message=Message(
                 role="user",
-                content=[TextBlock(text=task.prompt.text)],
+                content=opening_content,
             ),
             agent_role="main",
         )
@@ -512,6 +736,44 @@ def translate_aorchestra(
             )
         )
 
+    # ----- reconstruct user_agent stats for TraceEnd (mirror native loop) -----
+    # native (``loop.py:567-569``) writes user_agent_rounds / _max_rounds /
+    # _done. We rebuild them from the trajectory so the AO arm's TraceEnd
+    # carries the same metadata. Non-user_agent tasks → 0 / 0 / False, matching
+    # native's defaults for a task without a simulated user.
+    user_agent_rounds = _count_user_agent_rounds(trajectory_data)
+    ua_cfg = getattr(task, "user_agent", None)
+    # Native reports max_rounds only when the user agent is enabled, else 0
+    # (``loop.py``: ``ua_max_rounds = ua_cfg.max_rounds if ua_enabled else 0``).
+    # Mirror that gate so a disabled-user_agent task reports 0, not the config
+    # default. We can't see ``user_agent is not None`` here, but the trajectory's
+    # presence of user_agent_reply rounds is the observable proxy: a disabled UA
+    # never produces rounds.
+    ua_enabled = bool(getattr(ua_cfg, "enabled", False))
+    if ua_enabled:
+        try:
+            user_agent_max_rounds = int(getattr(ua_cfg, "max_rounds", 0) or 0)
+        except (TypeError, ValueError):
+            user_agent_max_rounds = 0
+    else:
+        user_agent_max_rounds = 0
+    # ``user_agent_done`` in native is True ONLY when the simulated user returned
+    # ``[DONE]`` (``generate_response`` → None) while rounds were not yet
+    # exhausted; round-exhaustion ends the loop with done=False. The trajectory
+    # has no explicit DONE marker, so we reconstruct conservatively: a run that
+    # had user_agent rounds, succeeded, and did NOT hit the round cap can only
+    # have terminated via [DONE] (the AO runner's user_agent loop breaks with
+    # success on either [DONE] or cap-exhaustion — and cap-exhaustion implies
+    # rounds == max_rounds). When rounds hit the cap, or the run failed, or
+    # there were no user_agent rounds, we report False. Prefer a conservative
+    # False over a false-positive True.
+    run_succeeded = bool(trajectory_data.get("success")) if isinstance(trajectory_data, dict) else False
+    user_agent_done = (
+        user_agent_rounds > 0
+        and run_succeeded
+        and (user_agent_max_rounds == 0 or user_agent_rounds < user_agent_max_rounds)
+    )
+
     # ----- write the trace -----
     with TraceWriter(trace_path) as writer:
         writer.write_event(
@@ -522,6 +784,11 @@ def translate_aorchestra(
                 harness="aorchestra",
             )
         )
+
+        # Multimodal MediaLoad events (mirrors native loop, emitted right after
+        # TraceStart so the grader's image_loaded dimension can find them).
+        for media_event in media_events:
+            writer.write_event(media_event)
 
         for msg in messages:
             writer.write_event(msg)
@@ -556,6 +823,9 @@ def translate_aorchestra(
                 other_time_s=0.0,
                 wall_time_s=wall_time_s,
                 failure_modes=failure_modes,
+                user_agent_rounds=user_agent_rounds,
+                user_agent_max_rounds=user_agent_max_rounds,
+                user_agent_done=user_agent_done,
             )
         )
 

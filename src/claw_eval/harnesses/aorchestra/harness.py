@@ -64,10 +64,12 @@ class AOrchestraHarness:
     def preflight(self, task: "TaskDefinition") -> list[str]:
         """Reject tasks whose semantics AOrchestra can't honour (§4.1).
 
-        Strict rejections:
-
-        - ``task.user_agent.enabled``: AOrchestra is a one-shot orchestration
-          loop; it has no mid-run "simulated user" injection hook.
+        Multi-turn ``user_agent`` (simulated user) is supported as of Part 2:
+        the ``complete`` action is treated as a user-turn boundary — the answer
+        is fed to ``UserAgent.generate_response`` and any reply is injected back
+        into ``MainAgent.context`` for the next attempt. The harness receives a
+        live ``UserAgent`` from the CLI (``_make_user_agent``) when the task has
+        ``user_agent.enabled`` set, so we no longer reject these tasks here.
 
         Deferred rejections (not done here):
 
@@ -79,11 +81,7 @@ class AOrchestraHarness:
           tool. Catching it here would require importing the bridge for
           every preflight — too expensive.
         """
-        errs: list[str] = []
-        ua = getattr(task, "user_agent", None)
-        if ua is not None and getattr(ua, "enabled", False):
-            errs.append("aorchestra harness does not support simulated user_agent")
-        return errs
+        return []
 
     # ------------------------------------------------------------------
     # Run — dispatcher
@@ -103,8 +101,11 @@ class AOrchestraHarness:
     ) -> HarnessResult:
         """Dispatch to host smoke or container path.
 
-        ``user_agent`` is accepted to keep the Protocol signature uniform but
-        ignored — preflight already rejects tasks that need it.
+        ``user_agent`` — when non-None (the CLI builds it from
+        ``_make_user_agent`` for tasks with ``user_agent.enabled``), it is
+        threaded into ``_runner.run_one_task`` so the orchestration loop can run
+        multi-turn simulated-user rounds (each ``complete`` action becomes a
+        user turn). When None, the loop behaves exactly as before (single-shot).
         """
         if sandbox_handle is not None:
             return self._run_container(
@@ -113,6 +114,7 @@ class AOrchestraHarness:
                 run_id=run_id,
                 cfg=cfg,
                 sandbox_handle=sandbox_handle,
+                user_agent=user_agent,
                 services_ctx=services_ctx,
             )
         return self._run_host_smoke(
@@ -120,6 +122,7 @@ class AOrchestraHarness:
             trace_dir=trace_dir,
             run_id=run_id,
             cfg=cfg,
+            user_agent=user_agent,
             services_ctx=services_ctx,
         )
 
@@ -134,6 +137,7 @@ class AOrchestraHarness:
         trace_dir: Path,
         run_id: str,
         cfg: "Config",
+        user_agent: "UserAgent | None" = None,
         services_ctx: "ServiceManager | None",
     ) -> HarnessResult:
         """Host smoke path: AOrchestra in-process, no sandbox container.
@@ -176,6 +180,7 @@ class AOrchestraHarness:
                         cfg,
                         case_dir=case_dir,
                         sandbox_url=None,
+                        user_agent=user_agent,
                     )
                 )
                 # Persist the bridge step_log so the trace adapter can read it.
@@ -235,6 +240,7 @@ class AOrchestraHarness:
         run_id: str,
         cfg: "Config",
         sandbox_handle: "ContainerHandle",
+        user_agent: "UserAgent | None" = None,
         services_ctx: "ServiceManager | None",
     ) -> HarnessResult:
         """Container path (Wave 4-E).
@@ -273,6 +279,7 @@ class AOrchestraHarness:
                         cfg,
                         case_dir=case_dir,
                         sandbox_url=sandbox_url,
+                        user_agent=user_agent,
                     )
                 )
                 # Persist the bridge step_log so the trace adapter can read it.

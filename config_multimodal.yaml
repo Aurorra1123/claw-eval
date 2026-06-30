@@ -1,3 +1,14 @@
+# ============================================================================
+# WARNING: This config is MISSING `model.input_modalities` and therefore
+# SILENTLY DROPS IMAGE INPUT. With the default `input_modalities: [text]`,
+# any image attachment is skipped before it reaches the model, so multimodal
+# (image-input) tasks collapse to ~0.2 scores (image_loaded=0).
+#
+# For multimodal / image-input evaluation use `config_multimodal_smoke.yaml`
+# instead (it sets `input_modalities: [text, image]` and points at the
+# deepwisdom newapi endpoint). This file is kept only for non-image runs.
+# ============================================================================
+
 # Agent Eval default configuration
 
 model:

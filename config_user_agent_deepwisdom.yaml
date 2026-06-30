@@ -1,0 +1,23 @@
+# user_agent 验证用 config — 全部走 deepwisdom newapi (与 rollout 一致)
+# model / judge / user_agent_model 三者都用 ${CLAWEVAL_LLM_*}
+
+model:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  context_window: 200000
+
+judge:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+  enabled: true
+
+user_agent_model:
+  api_key: ${CLAWEVAL_LLM_API_KEY}
+  base_url: ${CLAWEVAL_LLM_BASE_URL}
+  model_id: ${CLAWEVAL_LLM_MODEL}
+
+defaults:
+  trace_dir: traces
+  tasks_dir: tasks
