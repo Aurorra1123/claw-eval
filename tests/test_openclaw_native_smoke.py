@@ -85,3 +85,51 @@ def test_public_helpers_present() -> None:
             f"_openclaw_native missing required helper {name!r}"
         )
         assert callable(getattr(_openclaw_native, name))
+
+
+# ---------------------------------------------------------------------------
+# Model input modalities — the OpenClaw model entry must declare image/video
+# support, else ``modelSupportsInput(entry, "image")`` is false and OpenClaw
+# silently drops every image a media tool produces (the openclaw-arm vision
+# gap). See ``_resolve_model_input_modalities`` / ``_build_openclaw_temp_config``.
+
+
+def test_resolve_model_input_modalities_default(monkeypatch) -> None:
+    from claw_eval.harnesses import _openclaw_native
+
+    monkeypatch.delenv("CLAWEVAL_MODEL_INPUT_MODALITIES", raising=False)
+    mods = _openclaw_native._resolve_model_input_modalities()
+    assert "image" in mods
+    assert "text" in mods
+
+
+def test_resolve_model_input_modalities_env_override(monkeypatch) -> None:
+    from claw_eval.harnesses import _openclaw_native
+
+    monkeypatch.setenv("CLAWEVAL_MODEL_INPUT_MODALITIES", "text, bogus ,VIDEO")
+    mods = _openclaw_native._resolve_model_input_modalities()
+    assert mods == ["text", "video"]  # bogus dropped, case-normalized, deduped
+
+
+def test_build_openclaw_temp_config_declares_image_input(tmp_path, monkeypatch) -> None:
+    import json
+
+    from claw_eval.harnesses import _openclaw_native
+
+    monkeypatch.delenv("CLAWEVAL_MODEL_INPUT_MODALITIES", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    dst = str(tmp_path / "openclaw.json")
+    _openclaw_native._build_openclaw_temp_config(
+        dst_path=dst,
+        provider_id="openai",
+        target_base_url="https://api.z.ai/api/coding/paas/v4",
+        target_model="glm-5v-turbo",
+        target_api_key="sk-test",
+        workspace_dir=str(tmp_path),
+    )
+    cfg = json.loads((tmp_path / "openclaw.json").read_text())
+    entry = cfg["models"]["providers"]["openai"]["models"][0]
+    assert entry["id"] == "glm-5v-turbo"
+    assert "image" in entry.get("input", []), (
+        "model entry must declare image input so OpenClaw sends frames to the model"
+    )

@@ -38,7 +38,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
-from ...runner.sandbox_dispatcher import SandboxToolDispatcher
+from ...runner.sandbox_dispatcher import (
+    _ALWAYS_MEDIA_TOOLS as _DISPATCHER_ALWAYS_MEDIA_TOOLS,
+    _CONDITIONAL_MEDIA_TOOLS as _DISPATCHER_CONDITIONAL_MEDIA_TOOLS,
+    SandboxToolDispatcher,
+)
 from ...runner.sandbox_tools import SANDBOX_TOOL_NAMES
 from .schema_translate import SchemaTranslationError, json_schema_to_typebox
 
@@ -52,6 +56,17 @@ if TYPE_CHECKING:
 # (used by claweval runs) — mirror it here so bridge plugin route resolution
 # can never drift from the dispatcher's contract.
 SANDBOX_ENDPOINTS: dict[str, str] = dict(SandboxToolDispatcher._PATH_MAP)
+
+# Sandbox tools whose response can carry a ``frames`` array of base64 images:
+# ReadMedia / BrowserScreenshot always, and Read conditionally (image/PDF). These
+# need the *factory* tool form so the bridge can return native image content
+# blocks; see :func:`_render_one_tool`. Derived from the dispatcher's own media
+# sets so the bridge can never drift from the loop's frame-extraction contract.
+# The generated handler still gates on ``Array.isArray(body.frames)`` at runtime,
+# so a plain text ``Read`` (no frames) is unaffected.
+_MEDIA_FRAME_TOOLS: frozenset[str] = (
+    _DISPATCHER_ALWAYS_MEDIA_TOOLS | _DISPATCHER_CONDITIONAL_MEDIA_TOOLS
+)
 
 __all__ = [
     "BridgeHandle",
@@ -382,7 +397,20 @@ def _render_one_tool(
 
     Kept as one template string (rather than a multi-line builder) so the
     generated TS is easy to diff against the design doc sample in §3.4a.
+
+    Media tools (``ReadMedia`` / ``BrowserScreenshot``) are rendered via the
+    *factory* form so the bridge can return native image content blocks — see
+    :func:`_render_media_tool`. Every other tool keeps the plain ``execute``
+    form whose return value OpenClaw stringifies into a text tool result.
     """
+    if tool_name in _MEDIA_FRAME_TOOLS:
+        return _render_media_tool(
+            tool_name=tool_name,
+            description=description,
+            params_expr=params_expr,
+            url=url,
+            method=method,
+        )
     # 4-space indent matches the surrounding `tools: (tool) => [...]` block.
     return f"""    tool({{
       name: {_js_string(tool_name)},
@@ -427,6 +455,106 @@ def _render_one_tool(
         }});
         return body;
       }},
+    }})"""
+
+
+def _render_media_tool(
+    *,
+    tool_name: str,
+    description: str,
+    params_expr: str,
+    url: str,
+    method: str,
+) -> str:
+    """Render a media tool (``ReadMedia`` / ``BrowserScreenshot``) clause.
+
+    Why the *factory* form: ``defineToolPlugin``'s convenience ``execute`` path
+    runs every return value through ``wrapToolPluginResult``, which
+    ``JSON.stringify``s objects into a *single text block*. The sandbox server
+    returns ``{frames: [{image_b64, mime_type}, ...]}``; stringified, those
+    frames become inert base64 text that the runtime then truncates (~64KB),
+    collapsing e.g. 8 sampled video frames down to one corrupt frame. The model
+    is effectively blind on video.
+
+    The factory form returns an ``AgentToolResult`` verbatim (no
+    ``wrapToolPluginResult``), so we can emit one ``{type:"image"}`` content
+    block per frame — exactly how the native ``SandboxDispatcher`` feeds frames
+    to the loop. Base64 is stripped from the text summary to save tokens.
+    """
+    return f"""    tool({{
+      name: {_js_string(tool_name)},
+      description: {_js_string(description)},
+      parameters: {params_expr},
+      factory: (_ctx) => ({{
+        name: {_js_string(tool_name)},
+        label: {_js_string(tool_name)},
+        description: {_js_string(description)},
+        parameters: {params_expr},
+        execute: async (toolCallId: string, params: any, _signal?: unknown, _onUpdate?: unknown) => {{
+          const url = {_js_string(url)};
+          const method = {_js_string(method.upper())};
+          const started = Date.now();
+          let status = -1;
+          let body: any = null;
+          let errMsg: string | undefined;
+          try {{
+            const resp = await fetch(url, {{
+              method,
+              headers: {{ "content-type": "application/json" }},
+              body: JSON.stringify(params ?? {{}}),
+            }});
+            status = resp.status;
+            const text = await resp.text();
+            try {{
+              body = text ? JSON.parse(text) : null;
+            }} catch {{
+              body = text;
+            }}
+          }} catch (e) {{
+            errMsg = e instanceof Error ? e.message : String(e);
+            body = {{ error: errMsg }};
+          }}
+          recordCall({{
+            toolCallId: toolCallId ?? null,
+            tool: {_js_string(tool_name)},
+            url,
+            method,
+            request: params,
+            status,
+            response: body,
+            durationMs: Date.now() - started,
+            ...(errMsg ? {{ error: errMsg }} : {{}}),
+          }});
+          // Expand frames[] into native image content blocks so the multimodal
+          // model actually SEES them (see _render_media_tool docstring).
+          if (body && typeof body === "object" && Array.isArray(body.frames)) {{
+            const frames = body.frames.filter(
+              (f: any) => f && typeof f.image_b64 === "string" && f.image_b64.length > 0,
+            );
+            if (frames.length > 0) {{
+              const summary: any = {{}};
+              for (const k of Object.keys(body)) {{
+                if (k !== "frames") summary[k] = body[k];
+              }}
+              summary.frame_count = frames.length;
+              const content: any[] = [{{ type: "text", text: JSON.stringify(summary) }}];
+              for (const f of frames) {{
+                content.push({{
+                  type: "image",
+                  data: f.image_b64,
+                  mimeType: typeof f.mime_type === "string" && f.mime_type ? f.mime_type : "image/png",
+                }});
+              }}
+              return {{ content, details: summary }};
+            }}
+          }}
+          // No frames (error or empty): preserve JSON-as-text behavior.
+          if (typeof body === "string") {{
+            return {{ content: [{{ type: "text", text: body }}], details: body }};
+          }}
+          return {{ content: [{{ type: "text", text: JSON.stringify(body ?? null) }}], details: body }};
+        }},
+      }}),
     }})"""
 
 

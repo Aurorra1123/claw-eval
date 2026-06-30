@@ -219,6 +219,100 @@ def test_compile_plugin_source_handles_chinese_descriptions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Media tools render via the *factory* form returning image content blocks.
+#
+# Regression for the openclaw-arm vision gap: ReadMedia / BrowserScreenshot
+# responses carry ``frames:[{image_b64}]``. The plain ``execute`` form runs
+# through ``wrapToolPluginResult`` which JSON-stringifies the whole body into
+# one text block (then the runtime truncates it ~64KB), so the multimodal model
+# never sees the frames as images. The factory form returns an AgentToolResult
+# verbatim, letting us emit one ``{type:"image"}`` block per frame.
+
+from claw_eval.harnesses._openclaw_bridge.generator import (  # noqa: E402
+    _MEDIA_FRAME_TOOLS,
+    _render_one_tool,
+)
+
+
+def _render(tool_name: str) -> str:
+    return _render_one_tool(
+        tool_name=tool_name,
+        description="desc",
+        params_expr="Type.Object({})",
+        url="http://localhost:8080/read_media",
+        method="POST",
+    )
+
+
+def test_media_tools_render_as_factory_with_image_blocks() -> None:
+    for name in sorted(_MEDIA_FRAME_TOOLS):
+        src = _render(name)
+        # Factory form (not the auto-wrapped convenience execute) ...
+        assert "factory:" in src, f"{name} must use the factory form"
+        # ... that expands frames into native image content blocks ...
+        assert "Array.isArray(body.frames)" in src
+        assert 'type: "image"' in src
+        assert "f.image_b64" in src
+        assert "mimeType" in src
+        # ... and strips base64 from the text summary (frames key dropped).
+        assert 'if (k !== "frames")' in src
+        assert "frame_count" in src
+        # recorder still logs the raw body for bridge_traffic.jsonl.
+        assert "recordCall(" in src
+
+
+def test_non_media_tool_keeps_plain_execute_form() -> None:
+    src = _render("web_search")
+    assert "factory:" not in src
+    assert "return body;" in src
+    assert 'type: "image"' not in src
+
+
+def test_readmedia_is_in_media_frame_tools() -> None:
+    # ReadMedia / BrowserScreenshot always return frames; Read returns frames
+    # conditionally (image/PDF) — all three must use the factory image path.
+    assert "ReadMedia" in _MEDIA_FRAME_TOOLS
+    assert "BrowserScreenshot" in _MEDIA_FRAME_TOOLS
+    assert "Read" in _MEDIA_FRAME_TOOLS
+
+
+def test_read_tool_renders_as_factory_but_falls_back_to_text() -> None:
+    # Read goes through the factory form (so image reads surface as image
+    # blocks), but the runtime `frames` gate means a plain text read still
+    # returns text content — no regression for non-image files.
+    src = _render("Read")
+    assert "factory:" in src
+    assert "Array.isArray(body.frames)" in src
+    assert 'type: "image"' in src
+    # text fallback path present for non-frame (text-file) reads.
+    assert 'type: "text"' in src
+
+
+def test_compile_plugin_source_renders_injected_readmedia_as_factory() -> None:
+    """End-to-end: a task whose bridgeable tools include a SANDBOX media tool
+    compiles that tool via the factory + image-content path.
+    """
+    from claw_eval.models.task import ToolSpec
+
+    task = _load("T077_officeqa_highest_dept_spending")
+    task.tools.append(
+        ToolSpec(
+            name="ReadMedia",
+            description="Read an image/video/pdf and return frames.",
+            input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+        )
+    )
+    src = compile_plugin_source(task, sandbox_url="http://localhost:8080")
+    assert src is not None
+    # The injected ReadMedia tool routes to the sandbox server and uses factory.
+    assert "/read_media" in src
+    assert "factory:" in src
+    assert 'type: "image"' in src
+    # The original mock tool is untouched (plain execute form).
+    assert "return body;" in src
+
+
+# ---------------------------------------------------------------------------
 # Static test 2 — json_schema_to_typebox primitive coverage
 
 

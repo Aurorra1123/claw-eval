@@ -180,6 +180,31 @@ def _capture_openclaw_preflight(*, env: Dict[str, str], cwd: str, out_path: str)
     _write_json(out_path, result)
 
 
+_ALLOWED_INPUT_MODALITIES = ("text", "image", "audio", "video", "document")
+
+
+def _resolve_model_input_modalities() -> list[str]:
+    """Input modalities to declare on the OpenClaw model entry.
+
+    OpenClaw gates whether image/video content blocks are sent to the model on
+    the catalog entry's ``input`` array (``modelSupportsInput(entry, "image")``
+    -> ``entry.input?.includes("image")``). A configured model with no ``input``
+    field defaults to text-only, so OpenClaw silently drops every image a media
+    tool produces. claw-eval's agent-under-test is multimodal (the leaderboard
+    is GLM-5V), so default to declaring image/video support; allow override via
+    ``CLAWEVAL_MODEL_INPUT_MODALITIES`` (comma-separated) for text-only models.
+    """
+    raw = os.environ.get("CLAWEVAL_MODEL_INPUT_MODALITIES")
+    if raw is None or not raw.strip():
+        return ["text", "image", "video"]
+    seen: list[str] = []
+    for tok in raw.split(","):
+        m = tok.strip().lower()
+        if m in _ALLOWED_INPUT_MODALITIES and m not in seen:
+            seen.append(m)
+    return seen or ["text"]
+
+
 def _build_openclaw_temp_config(
     *,
     dst_path: str,
@@ -217,6 +242,7 @@ def _build_openclaw_temp_config(
             "id": target_model,
             "name": target_model,
             "api": "openai-completions",
+            "input": _resolve_model_input_modalities(),
         }
     ]
     providers[provider_id] = provider_cfg
